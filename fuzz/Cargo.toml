@@ -1,0 +1,19 @@
+[package]
+name = "udp2raw-ng-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+udp2raw-ng-core = { path = "../crates/udp2raw-ng-core" }
+
+[[bin]]
+name = "decode-wire-frame"
+path = "fuzz_targets/decode_wire_frame.rs"
+test = false
+doc = false
+bench = false

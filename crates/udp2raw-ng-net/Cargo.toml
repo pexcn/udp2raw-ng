@@ -1,0 +1,16 @@
+[package]
+name = "udp2raw-ng-net"
+description = "Optional Linux packet transport adapters for udp2raw-ng"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+udp2raw-ng-core = { path = "../udp2raw-ng-core" }
+
+[lints]
+workspace = true

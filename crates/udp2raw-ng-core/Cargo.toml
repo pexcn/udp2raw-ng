@@ -1,0 +1,17 @@
+[package]
+name = "udp2raw-ng-core"
+description = "Platform-independent protocol engine for udp2raw-ng"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

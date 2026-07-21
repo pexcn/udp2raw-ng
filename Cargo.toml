@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/udp2raw-ng-core",
+    "crates/udp2raw-ng-net",
+    "crates/udp2raw-ng",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["udp2raw-ng contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/udp2raw-ng"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+getrandom = "0.2"
+thiserror = "2.0"
+tokio = { version = "1.46", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zeroize = "1.8"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

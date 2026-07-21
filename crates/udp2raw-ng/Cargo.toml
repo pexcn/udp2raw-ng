@@ -1,0 +1,29 @@
+[package]
+name = "udp2raw-ng"
+description = "Official CLI and managed service host for udp2raw-ng"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "udp2raw_ng"
+path = "src/lib.rs"
+
+[[bin]]
+name = "udp2raw-ng"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+udp2raw-ng-core = { path = "../udp2raw-ng-core" }
+udp2raw-ng-net = { path = "../udp2raw-ng-net" }
+
+[lints]
+workspace = true
