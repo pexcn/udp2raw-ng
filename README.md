@@ -2,7 +2,7 @@
 
 一个以可复用 Rust 库为核心、面向 Linux FakeTCP UDP 数据报隧道的全新项目。
 
-> **当前状态：阶段 2 安全核心，不可用于生产或直接部署到不可信公网。** 平台无关核心已实现 PSK 认证握手、五种受保护 record suite 和防重放；CLI 仍会安全拒绝启动真实隧道。Raw socket、AF_PACKET、FakeTCP、握手丢包恢复、PMTU 探测和 Netfilter RST 抑制尚未实现。
+> **当前状态：阶段 2 可靠握手核心，不可用于生产或直接部署到不可信公网。** 平台无关核心已实现带无状态 Cookie、丢包重试和受保护最终确认的 PSK 认证握手、五种受保护 record suite 和防重放；CLI 仍会安全拒绝启动真实隧道。Raw socket、AF_PACKET、FakeTCP、PMTU 探测、完整来源速率限制和 Netfilter RST 抑制尚未实现。
 
 完整需求见 [udp2raw-ng-spec.md](docs/udp2raw-ng-spec.md)，当前实现边界见 [docs/implementation-status.md](docs/implementation-status.md)。
 
@@ -15,9 +15,11 @@
 
 ## 当前可用能力
 
-- 有界、版本化的 v2 帧编码/解码；
+- 有界、版本化的 v3 帧编码/解码；
 - `SessionId` / `ConversationId` 强类型；
-- 三段式 PSK/HMAC-SHA256 transcript 认证握手；
+- PSK/HMAC-SHA256 transcript 认证握手；
+- 来源绑定、短时有效、服务端进程随机密钥保护的无状态握手 Cookie；
+- `ClientHello` / `ClientFinish` 定时重试、幂等 server 响应和受保护 `HandshakeAck`；
 - HKDF-SHA256 方向密钥和 nonce prefix 派生；
 - ChaCha20-Poly1305、XChaCha20-Poly1305、AES-128-GCM、AES-256-GCM；
 - `none` 明文加 HMAC-SHA256 的强制认证模式；
@@ -41,7 +43,7 @@
     cargo run -p udp2raw-ng -- client --help
     cargo run -p udp2raw-ng -- server --help
 
-即使参数有效，非环境检查模式也会以错误退出，因为 Linux FakeTCP 数据面和公网握手抗洪泛/丢包恢复尚未实现。
+即使参数有效，非环境检查模式也会以错误退出，因为 Linux FakeTCP 数据面、完整按来源速率限制和运行时服务化尚未实现。
 
 ## Fuzz
 

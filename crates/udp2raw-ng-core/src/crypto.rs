@@ -5,7 +5,7 @@ use zeroize::Zeroizing;
 
 use crate::{CipherSuite, CryptoError, Psk, SessionId};
 
-const PROTOCOL_DOMAIN: &[u8] = b"udp2raw-ng/v2";
+const PROTOCOL_DOMAIN: &[u8] = b"udp2raw-ng/v3";
 
 type HmacSha256 = Hmac<Sha256>;
 

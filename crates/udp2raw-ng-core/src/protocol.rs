@@ -1,6 +1,6 @@
 use crate::{ConversationId, FrameError, SessionId};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_PAYLOAD: usize = 65_507;
 pub(crate) const MAX_FRAME_BODY: usize = MAX_FRAME_PAYLOAD + 32;
 pub(crate) const HEADER_LENGTH: usize = 48;
@@ -12,9 +12,11 @@ pub enum FrameType {
     ClientHello = 1,
     ServerHello = 2,
     ClientFinish = 3,
+    HelloRetry = 4,
     Data = 16,
     Heartbeat = 17,
     Close = 18,
+    HandshakeAck = 19,
     MtuProbe = 32,
     MtuAck = 33,
 }
@@ -23,12 +25,15 @@ impl FrameType {
     pub(crate) const fn is_handshake(self) -> bool {
         matches!(
             self,
-            Self::ClientHello | Self::ServerHello | Self::ClientFinish
+            Self::ClientHello | Self::ServerHello | Self::ClientFinish | Self::HelloRetry
         )
     }
 
     pub(crate) const fn is_protected(self) -> bool {
-        matches!(self, Self::Data | Self::Heartbeat | Self::Close)
+        matches!(
+            self,
+            Self::Data | Self::Heartbeat | Self::Close | Self::HandshakeAck
+        )
     }
 }
 
@@ -40,9 +45,11 @@ impl TryFrom<u8> for FrameType {
             1 => Ok(Self::ClientHello),
             2 => Ok(Self::ServerHello),
             3 => Ok(Self::ClientFinish),
+            4 => Ok(Self::HelloRetry),
             16 => Ok(Self::Data),
             17 => Ok(Self::Heartbeat),
             18 => Ok(Self::Close),
+            19 => Ok(Self::HandshakeAck),
             32 => Ok(Self::MtuProbe),
             33 => Ok(Self::MtuAck),
             _ => Err(FrameError::UnknownFrameType(value)),

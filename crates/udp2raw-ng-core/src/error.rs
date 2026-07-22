@@ -10,8 +10,18 @@ pub enum ConfigError {
     ZeroConversationIdleTimeout,
     #[error("handshake timeout must be greater than zero")]
     ZeroHandshakeTimeout,
+    #[error("handshake retry interval must be greater than zero")]
+    ZeroHandshakeRetryInterval,
+    #[error("handshake retry interval must not exceed the handshake timeout")]
+    HandshakeRetryExceedsTimeout,
+    #[error("handshake attempt limit must be greater than zero")]
+    ZeroHandshakeAttemptLimit,
+    #[error("handshake cookie lifetime must be greater than zero")]
+    ZeroHandshakeCookieLifetime,
     #[error("pending handshake limit must be greater than zero")]
     ZeroPendingHandshakeLimit,
+    #[error("per-peer pending handshake limit must be greater than zero")]
+    ZeroPerPeerPendingHandshakeLimit,
     #[error("session limit must be greater than zero")]
     ZeroSessionLimit,
     #[error("frame payload limit {value} is outside 1..={maximum}")]
@@ -72,6 +82,8 @@ pub enum HandshakeError {
     CipherSuiteMismatch,
     #[error("handshake transcript authentication failed")]
     AuthenticationFailed,
+    #[error("handshake cookie is invalid or expired")]
+    InvalidCookie,
     #[error("no matching pending handshake")]
     UnknownPendingHandshake,
 }
@@ -114,6 +126,8 @@ pub enum EngineError {
     ConversationCapacity,
     #[error("pending handshake capacity has been reached")]
     PendingHandshakeCapacity,
+    #[error("per-peer pending handshake capacity has been reached")]
+    PerPeerPendingHandshakeCapacity,
     #[error("authenticated session capacity has been reached")]
     SessionCapacity,
     #[error("unknown conversation")]

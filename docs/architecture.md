@@ -32,3 +32,17 @@ bounded envelope parse
 ```
 
 Authentication failure never advances the replay window. Unauthenticated input cannot create an authenticated session or conversation and cannot reach plaintext delivery.
+
+The v3 handshake is loss-tolerant without making the client optimistic:
+
+```text
+ClientHello
+    -> stateless authenticated HelloRetry(cookie)
+ClientHello(cookie)
+    -> ServerHello (bounded pending state starts here)
+ClientFinish
+    -> protected HandshakeAck
+    -> both endpoints Ready
+```
+
+The server cookie is bound to the host-assigned `PeerId`, handshake transcript fields, cipher suite and a bounded lifetime. It is authenticated with a process-random secret separate from the PSK. Duplicate validated hellos, finishes and acknowledgements are idempotent. The client remains `Handshaking` until it opens the protected acknowledgement.

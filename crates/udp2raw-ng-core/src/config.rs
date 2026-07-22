@@ -86,8 +86,13 @@ pub struct EngineConfig {
     pub max_conversations: usize,
     pub max_frame_payload: usize,
     pub conversation_idle_timeout: Duration,
+    pub handshake_retry_interval: Duration,
     pub handshake_timeout: Duration,
+    pub handshake_max_attempts: usize,
+    pub require_handshake_cookie: bool,
+    pub handshake_cookie_lifetime: Duration,
     pub max_pending_handshakes: usize,
+    pub max_pending_handshakes_per_peer: usize,
     pub max_sessions: usize,
 }
 
@@ -122,11 +127,26 @@ impl EngineConfig {
         if self.conversation_idle_timeout.is_zero() {
             return Err(ConfigError::ZeroConversationIdleTimeout);
         }
+        if self.handshake_retry_interval.is_zero() {
+            return Err(ConfigError::ZeroHandshakeRetryInterval);
+        }
         if self.handshake_timeout.is_zero() {
             return Err(ConfigError::ZeroHandshakeTimeout);
         }
+        if self.handshake_retry_interval > self.handshake_timeout {
+            return Err(ConfigError::HandshakeRetryExceedsTimeout);
+        }
+        if self.handshake_max_attempts == 0 {
+            return Err(ConfigError::ZeroHandshakeAttemptLimit);
+        }
+        if self.handshake_cookie_lifetime.is_zero() {
+            return Err(ConfigError::ZeroHandshakeCookieLifetime);
+        }
         if self.max_pending_handshakes == 0 {
             return Err(ConfigError::ZeroPendingHandshakeLimit);
+        }
+        if self.max_pending_handshakes_per_peer == 0 {
+            return Err(ConfigError::ZeroPerPeerPendingHandshakeLimit);
         }
         if self.max_sessions == 0 {
             return Err(ConfigError::ZeroSessionLimit);
@@ -144,8 +164,13 @@ impl Default for EngineConfig {
             max_conversations: 1024,
             max_frame_payload: crate::MAX_FRAME_PAYLOAD,
             conversation_idle_timeout: Duration::from_secs(180),
+            handshake_retry_interval: Duration::from_millis(500),
             handshake_timeout: Duration::from_secs(10),
+            handshake_max_attempts: 8,
+            require_handshake_cookie: true,
+            handshake_cookie_lifetime: Duration::from_secs(30),
             max_pending_handshakes: 1024,
+            max_pending_handshakes_per_peer: 64,
             max_sessions: 4096,
         }
     }

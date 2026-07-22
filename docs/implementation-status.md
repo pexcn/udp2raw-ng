@@ -2,7 +2,7 @@
 
 ## 本轮目标
 
-本轮将平台无关核心从“仅有结构校验的明文帧脚手架”推进到可由纯内存或自定义可信 transport 驱动的认证会话：固化三段式 PSK 握手、方向密钥派生、受保护 record layer、防重放入口和有界内存 transport。真实 Linux FakeTCP 数据面仍不在本轮范围内。
+本轮将平台无关核心从三段式认证握手推进到可靠、非乐观的 v3 握手：增加无状态 Cookie、握手重试、幂等响应、受保护最终确认和按来源 pending 上限。真实 Linux FakeTCP 数据面仍不在本轮范围内。
 
 ## 已实现
 
@@ -14,17 +14,24 @@
 - `Idle`、`Handshaking`、`Ready`、`Closed` 会话状态模型；
 - conversation 容量、空闲回收、反向映射和 `(session, conversation)` 隔离；
 - PSK 长度限制、调试输出脱敏和 drop 时清零；
-- 协议版本提升到 v2，旧的 v1 未认证帧不会被接受。
+- 协议版本提升到 v3，旧版本帧不会被接受。
 
 ### 握手与密钥派生
 
-- `ClientHello -> ServerHello -> ClientFinish` 三段式 PSK 认证握手；
+- `ClientHello -> HelloRetry(cookie) -> ClientHello(cookie) -> ServerHello -> ClientFinish -> HandshakeAck` PSK 认证握手；
+- `HelloRetry` 本身由 PSK 派生握手密钥认证，客户端不会接受伪造 cookie challenge；
+- Cookie 绑定 `PeerId`、handshake ID、client nonce、suite 和签发时间，并使用服务端进程随机独立密钥认证；
+- 无 Cookie 或 Cookie 无效/过期时服务端不创建 pending handshake；
+- Cookie 验证使用常量时间 MAC 校验，默认有效期 30 秒；
+- `ClientHello` 和 `ClientFinish` 按配置间隔重试，受总超时和最大尝试次数约束；
+- 重复 cookie hello 返回同一 `ServerHello`，重复有效 finish 返回同一受保护 `HandshakeAck`；
+- client 只有成功打开 `HandshakeAck` 后才进入 `Ready` 并报告 `SessionEstablished`；
 - server hello 和 client finish 的 HMAC-SHA256 transcript 认证；
 - cipher suite、session ID、client/server nonce、session salt 和握手 transcript 的绑定；
 - HKDF-SHA256 方向密钥与 nonce prefix 派生；
 - client-to-server / server-to-client 方向隔离，以及 record key / nonce prefix 用途隔离；
 - cipher suite 不一致时明确拒绝，不做隐式降级；
-- 全局有界 pending handshake、握手超时回收和已认证 session 容量限制；
+- 全局及按 `PeerId` 有界 pending handshake、握手超时回收和已认证 session 容量限制；
 - server 只有在验证有效 `ClientFinish` 后才创建已认证 session。
 
 ### Record layer
@@ -46,6 +53,8 @@
 - `PacketTransport` 的有界纯内存双端实现；
 - FIFO 双向传输、`PeerId` 保留、队列满错误、peer drop/关闭行为和 waker 唤醒；
 - 五种 cipher suite 的完整内存握手与双向数据 round-trip；
+- 握手 challenge、server hello、finish 和 ack 丢失后的重试/幂等测试；
+- Cookie 来源绑定、过期和 per-peer pending 限制测试；
 - 错 PSK、suite 不一致、密文/tag 篡改、重复 record、认证失败后合法同 packet number 仍可接受的测试；
 - 非 `Ready` 状态业务数据拒绝；
 - 基础帧所有截断位置和 trailing bytes 拒绝测试；
@@ -54,8 +63,8 @@
 
 ## 明确未实现
 
-- 第四段 server 握手确认、握手重试、丢包恢复和无状态 cookie；
-- 面向公网握手洪泛的完整防护、按来源限速和 per-peer pending 限制；
+- 面向公网握手洪泛的完整防护和时间窗 token-bucket 来源速率限制；
+- Cookie 密钥轮换、跨进程平滑轮换和可观测拒绝指标；
 - session 恢复凭据、stable client identity 和密钥轮换/非零 epoch；
 - heartbeat、session 超时、自动重连和恢复；
 - AES 硬件加速实际启用/软件回退的可观测指标；
@@ -68,16 +77,16 @@
 
 ## 当前安全边界
 
-平台无关的 v2 内层协议已经提供 PSK 身份证明、完整性、防重放，以及除 `none` 外的机密性；`none` 只暴露 payload 内容，不会关闭握手认证、record 认证或防重放。未经认证的网络帧不能创建已认证 session、创建 conversation 或投递应用明文。
+平台无关的 v3 内层协议已经提供 PSK 身份证明、完整性、防重放，以及除 `none` 外的机密性；`none` 只暴露 payload 内容，不会关闭握手认证、record 认证或防重放。未经认证的网络帧不能创建已认证 session、创建 conversation 或投递应用明文。
 
-但当前实现还不能宣称适合直接部署到不可信公网：三段式握手中 client 发出 `ClientFinish` 后即进入本地 `Ready`，尚无 server 最终确认或丢包重试；server 对 `ClientHello` 会分配有界短期状态并执行密码运算，尚无无状态 cookie 和来源速率限制。`PeerId` 由宿主分配，仅用于路由，不是安全身份。
+client 不再在发出 `ClientFinish` 后乐观进入 `Ready`；只有受保护 server ack 通过 record 认证和防重放后才建立会话。server 在 Cookie 验证前不分配 pending 状态，并有全局及 per-peer 上限。但当前实现还不能宣称适合直接部署到不可信公网：尚无 token-bucket 来源速率限制、分布式攻击缓解、Cookie 密钥轮换和对应指标。`PeerId` 由宿主分配，是 Cookie 的路径绑定输入和路由元数据，不是稳定安全身份；宿主必须保证同一路径在握手期间映射稳定且攻击者不能任意冒用。
 
 真实 Linux tunnel 仍不可用。CLI 的正常运行路径继续安全拒绝启动，`LinuxFakeTcpTransport` 的所有操作继续返回 `NotImplemented`，不会将安全核心静默降级为裸网络传输。
 
 ## 下一阶段建议
 
-1. 增加握手重试、server 最终确认/首个受保护 record 隐式确认、超时和无状态 cookie；
-2. 实现 heartbeat、session 生命周期、重连和恢复凭据，并为 epoch/key rotation 固化状态机；
+1. 实现 heartbeat、session 生命周期、重连和恢复凭据，并为 epoch/key rotation 固化状态机；
+2. 增加来源 token-bucket、Cookie 密钥轮换和握手拒绝/重试指标；
 3. 实现 Tokio worker shard、有界队列和纯 UDP upstream harness；
 4. 开始 Linux FakeTCP 报文编解码、校验和、AF_PACKET/raw socket 与 cBPF；
 5. 最后接入 route/neighbor Netlink、PMTU 和 Netfilter RST guard。
