@@ -16,8 +16,13 @@ license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/udp2raw-ng"
 
 [workspace.dependencies]
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 getrandom = "0.2"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.46", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"

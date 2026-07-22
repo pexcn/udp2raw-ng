@@ -8,6 +8,12 @@ pub enum ConfigError {
     ZeroConversationLimit,
     #[error("conversation idle timeout must be greater than zero")]
     ZeroConversationIdleTimeout,
+    #[error("handshake timeout must be greater than zero")]
+    ZeroHandshakeTimeout,
+    #[error("pending handshake limit must be greater than zero")]
+    ZeroPendingHandshakeLimit,
+    #[error("session limit must be greater than zero")]
+    ZeroSessionLimit,
     #[error("frame payload limit {value} is outside 1..={maximum}")]
     InvalidFramePayloadLimit { value: usize, maximum: usize },
     #[error("unsupported cipher suite: {0}")]
@@ -34,6 +40,8 @@ pub enum FrameError {
     InvalidPayloadLength,
     #[error("payload exceeds the configured protocol limit")]
     PayloadTooLarge,
+    #[error("frame fields are invalid for its type")]
+    InvalidFrameFields,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -44,22 +52,82 @@ pub enum ReplayError {
     TooOld,
 }
 
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum CryptoError {
+    #[error("message authentication failed")]
+    AuthenticationFailed,
+    #[error("key derivation failed")]
+    KeyDerivationFailed,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum HandshakeError {
+    #[error("unexpected handshake message")]
+    UnexpectedMessage,
+    #[error("malformed handshake message")]
+    Malformed,
+    #[error("handshake identifier does not match")]
+    HandshakeIdMismatch,
+    #[error("handshake selected a different cipher suite")]
+    CipherSuiteMismatch,
+    #[error("handshake transcript authentication failed")]
+    AuthenticationFailed,
+    #[error("no matching pending handshake")]
+    UnknownPendingHandshake,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum RecordError {
+    #[error(transparent)]
+    Frame(#[from] FrameError),
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
+    #[error(transparent)]
+    Replay(#[from] ReplayError),
+    #[error("record belongs to another session")]
+    SessionMismatch,
+    #[error("record epoch is unsupported")]
+    UnsupportedEpoch,
+    #[error("record type is not protected application data")]
+    InvalidRecordType,
+    #[error("record authentication tag is truncated")]
+    TruncatedTag,
+    #[error("packet number space exhausted; a new session is required")]
+    PacketNumberExhausted,
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
     Frame(#[from] FrameError),
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
+    #[error(transparent)]
+    Handshake(#[from] HandshakeError),
+    #[error(transparent)]
+    Record(#[from] RecordError),
     #[error("this event is not valid for the engine role")]
     InvalidRole,
     #[error("conversation capacity has been reached")]
     ConversationCapacity,
+    #[error("pending handshake capacity has been reached")]
+    PendingHandshakeCapacity,
+    #[error("authenticated session capacity has been reached")]
+    SessionCapacity,
     #[error("unknown conversation")]
     UnknownConversation,
     #[error("local payload exceeds the configured maximum")]
     PayloadTooLarge,
     #[error("packet number space exhausted; a new session is required")]
     PacketNumberExhausted,
+    #[error("session is not ready for application data")]
+    SessionNotReady,
+    #[error("unknown authenticated session")]
+    UnknownSession,
+    #[error("frame arrived from an unexpected transport peer")]
+    UnexpectedPeer,
     #[error("operating system randomness is unavailable")]
     RandomnessUnavailable,
 }

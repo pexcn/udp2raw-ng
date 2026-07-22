@@ -259,7 +259,7 @@ fn run(cli: Cli) -> Result<(), String> {
         packet_workers = common.packet_workers,
         "configuration accepted"
     );
-    Err("production execution is intentionally disabled: authenticated handshake, FakeTCP, AF_PACKET, and Netfilter are not implemented yet".to_owned())
+    Err("production execution is intentionally disabled: FakeTCP, AF_PACKET, Netfilter, and handshake loss/flood hardening are not implemented yet".to_owned())
 }
 
 fn validate_common(common: &CommonArgs) -> Result<(), String> {

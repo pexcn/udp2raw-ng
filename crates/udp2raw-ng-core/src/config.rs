@@ -25,6 +25,31 @@ pub enum CipherSuite {
     NoneAuthenticated,
 }
 
+impl CipherSuite {
+    pub(crate) const fn wire_id(self) -> u8 {
+        match self {
+            Self::ChaCha20Poly1305 => 1,
+            Self::XChaCha20Poly1305 => 2,
+            Self::Aes128Gcm => 3,
+            Self::Aes256Gcm => 4,
+            Self::NoneAuthenticated => 5,
+        }
+    }
+
+    pub(crate) fn from_wire_id(value: u8) -> Result<Self, ConfigError> {
+        match value {
+            1 => Ok(Self::ChaCha20Poly1305),
+            2 => Ok(Self::XChaCha20Poly1305),
+            3 => Ok(Self::Aes128Gcm),
+            4 => Ok(Self::Aes256Gcm),
+            5 => Ok(Self::NoneAuthenticated),
+            _ => Err(ConfigError::UnsupportedCipherSuite(format!(
+                "wire id {value}"
+            ))),
+        }
+    }
+}
+
 impl fmt::Display for CipherSuite {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -61,6 +86,9 @@ pub struct EngineConfig {
     pub max_conversations: usize,
     pub max_frame_payload: usize,
     pub conversation_idle_timeout: Duration,
+    pub handshake_timeout: Duration,
+    pub max_pending_handshakes: usize,
+    pub max_sessions: usize,
 }
 
 impl EngineConfig {
@@ -94,6 +122,15 @@ impl EngineConfig {
         if self.conversation_idle_timeout.is_zero() {
             return Err(ConfigError::ZeroConversationIdleTimeout);
         }
+        if self.handshake_timeout.is_zero() {
+            return Err(ConfigError::ZeroHandshakeTimeout);
+        }
+        if self.max_pending_handshakes == 0 {
+            return Err(ConfigError::ZeroPendingHandshakeLimit);
+        }
+        if self.max_sessions == 0 {
+            return Err(ConfigError::ZeroSessionLimit);
+        }
         Ok(())
     }
 }
@@ -107,6 +144,9 @@ impl Default for EngineConfig {
             max_conversations: 1024,
             max_frame_payload: crate::MAX_FRAME_PAYLOAD,
             conversation_idle_timeout: Duration::from_secs(180),
+            handshake_timeout: Duration::from_secs(10),
+            max_pending_handshakes: 1024,
+            max_sessions: 4096,
         }
     }
 }

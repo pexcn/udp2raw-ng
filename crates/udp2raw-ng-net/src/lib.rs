@@ -1,23 +1,29 @@
-//! Optional packet transport boundary for Linux-specific FakeTCP support.
-//!
-//! Raw sockets, AF_PACKET, cBPF, and Netfilter management are intentionally
-//! unimplemented in this initial scaffold. The explicit error prevents callers
-//! from mistaking the placeholder for a safe production transport.
+//! Packet transport boundary with a bounded in-memory implementation for tests
+//! and embedding. Raw sockets, AF_PACKET, cBPF, and Netfilter management remain
+//! unimplemented; the Linux placeholder fails closed.
 
 use std::task::{Context, Poll};
 
 use thiserror::Error;
+use udp2raw_ng_core::PeerId;
 
 pub use udp2raw_ng_core;
 
+mod memory;
+pub use memory::{MemoryTransport, MemoryTransportError, memory_transport_pair};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutboundPacket {
+    /// Host-assigned route for the remote endpoint.
+    pub peer_id: PeerId,
     /// Authenticated tunnel frame to place in a FakeTCP payload.
     pub frame: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InboundPacket {
+    /// Host-assigned route identifying the transport sender.
+    pub peer_id: PeerId,
     /// Tunnel frame extracted from a validated outer packet.
     pub frame: Vec<u8>,
 }

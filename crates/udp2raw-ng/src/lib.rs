@@ -1,7 +1,8 @@
 //! Tokio managed-service scaffolding for embedding `udp2raw-ng`.
 //!
 //! The service lifecycle is defined, but production packet I/O remains disabled
-//! until the Linux FakeTCP adapter and authenticated core record layer exist.
+//! until the Linux FakeTCP adapter and worker runtime are implemented. The core
+//! authenticated record layer can already be driven by custom transports.
 
 use std::marker::PhantomData;
 

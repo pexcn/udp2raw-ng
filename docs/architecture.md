@@ -5,6 +5,7 @@ flowchart LR
     Host[Embedding host / CLI] -->|TunnelEvent| Core[udp2raw-ng-core]
     Core -->|TunnelAction| Host
     Host --> Transport[PacketTransport]
+    Transport --> Memory[Bounded memory pair]
     Transport -. future .-> Linux[Linux FakeTCP adapter]
 ```
 
@@ -18,3 +19,16 @@ udp2raw-ng --------------------> udp2raw-ng-core
 ```
 
 The outer TCP/IP envelope is never a security boundary. Once implemented, only the authenticated inner protocol may create or mutate logical session and conversation state.
+
+The authenticated receive path is deliberately ordered as:
+
+```text
+bounded envelope parse
+    -> session/direction/context validation
+    -> AEAD or HMAC authentication
+    -> replay-window update
+    -> plaintext return
+    -> session/conversation mutation or delivery
+```
+
+Authentication failure never advances the replay window. Unauthenticated input cannot create an authenticated session or conversation and cannot reach plaintext delivery.

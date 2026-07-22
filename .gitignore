@@ -1,3 +1,4 @@
+.vscode/
 /target
 /fuzz/target
 Cargo.lock

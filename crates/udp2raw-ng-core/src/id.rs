@@ -3,6 +3,21 @@ use std::num::NonZeroU64;
 
 use crate::EngineError;
 
+/// Host-assigned transport route identifier. It is routing metadata, not an
+/// authenticated identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PeerId(u64);
+
+impl PeerId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Random identifier scoped to an authenticated session.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConversationId(NonZeroU64);

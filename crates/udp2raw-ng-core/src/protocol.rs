@@ -1,12 +1,11 @@
 use crate::{ConversationId, FrameError, SessionId};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_PAYLOAD: usize = 65_507;
+pub(crate) const MAX_FRAME_BODY: usize = MAX_FRAME_PAYLOAD + 32;
+pub(crate) const HEADER_LENGTH: usize = 48;
 const MAGIC: [u8; 4] = *b"U2NG";
-const HEADER_LENGTH: usize = 48;
 
-/// Extensible inner frame kind. Encryption and transcript formats are not yet
-/// implemented, so data frames produced in this milestone are test-only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FrameType {
@@ -18,6 +17,19 @@ pub enum FrameType {
     Close = 18,
     MtuProbe = 32,
     MtuAck = 33,
+}
+
+impl FrameType {
+    pub(crate) const fn is_handshake(self) -> bool {
+        matches!(
+            self,
+            Self::ClientHello | Self::ServerHello | Self::ClientFinish
+        )
+    }
+
+    pub(crate) const fn is_protected(self) -> bool {
+        matches!(self, Self::Data | Self::Heartbeat | Self::Close)
+    }
 }
 
 impl TryFrom<u8> for FrameType {
@@ -38,10 +50,8 @@ impl TryFrom<u8> for FrameType {
     }
 }
 
-/// A bounded, versioned wire envelope.
-///
-/// This representation deliberately reserves an epoch and flags field for
-/// authenticated key rotation and protocol evolution.
+/// Versioned wire envelope. For protected frames `payload` contains ciphertext
+/// and its authentication tag, not application plaintext.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WireFrame {
     pub session_id: SessionId,
@@ -54,26 +64,13 @@ pub struct WireFrame {
 
 impl WireFrame {
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        if self.payload.len() > MAX_FRAME_PAYLOAD {
+        self.validate_fields()?;
+        if self.payload.len() > MAX_FRAME_BODY {
             return Err(FrameError::PayloadTooLarge);
         }
-        let payload_length =
-            u32::try_from(self.payload.len()).map_err(|_| FrameError::PayloadTooLarge)?;
+        let header = self.encoded_header(self.payload.len())?;
         let mut output = Vec::with_capacity(HEADER_LENGTH + self.payload.len());
-        output.extend_from_slice(&MAGIC);
-        output.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-        output.push(self.frame_type as u8);
-        output.push(0); // Reserved flags; authenticated in the future.
-        output.extend_from_slice(&self.epoch.to_be_bytes());
-        output.extend_from_slice(&self.session_id.to_be_bytes());
-        output.extend_from_slice(&self.packet_number.to_be_bytes());
-        output.extend_from_slice(
-            &self
-                .conversation_id
-                .map_or(0, ConversationId::get)
-                .to_be_bytes(),
-        );
-        output.extend_from_slice(&payload_length.to_be_bytes());
+        output.extend_from_slice(&header);
         output.extend_from_slice(&self.payload);
         Ok(output)
     }
@@ -89,7 +86,7 @@ impl WireFrame {
         if version != PROTOCOL_VERSION {
             return Err(FrameError::UnsupportedVersion(version));
         }
-        FrameType::try_from(input[6])?;
+        let frame_type = FrameType::try_from(input[6])?;
         if input[7] != 0 {
             return Err(FrameError::ReservedFlags);
         }
@@ -97,7 +94,7 @@ impl WireFrame {
             input[44..48].try_into().expect("fixed slice"),
         ))
         .map_err(|_| FrameError::InvalidPayloadLength)?;
-        if payload_length > MAX_FRAME_PAYLOAD {
+        if payload_length > MAX_FRAME_BODY {
             return Err(FrameError::PayloadTooLarge);
         }
         if input.len() != HEADER_LENGTH + payload_length {
@@ -105,15 +102,50 @@ impl WireFrame {
         }
         let raw_conversation = u64::from_be_bytes(input[36..44].try_into().expect("fixed slice"));
         let conversation_id = std::num::NonZeroU64::new(raw_conversation).map(ConversationId::new);
-        Ok(Self {
+        let frame = Self {
             session_id: SessionId::from_u128(u128::from_be_bytes(
                 input[12..28].try_into().expect("fixed slice"),
             )),
             packet_number: u64::from_be_bytes(input[28..36].try_into().expect("fixed slice")),
             epoch: u32::from_be_bytes(input[8..12].try_into().expect("fixed slice")),
-            frame_type: FrameType::try_from(input[6])?,
+            frame_type,
             conversation_id,
             payload: input[HEADER_LENGTH..].to_vec(),
-        })
+        };
+        frame.validate_fields()?;
+        Ok(frame)
+    }
+
+    pub(crate) fn encoded_header(
+        &self,
+        body_length: usize,
+    ) -> Result<[u8; HEADER_LENGTH], FrameError> {
+        let body_length = u32::try_from(body_length).map_err(|_| FrameError::PayloadTooLarge)?;
+        let mut output = [0_u8; HEADER_LENGTH];
+        output[..4].copy_from_slice(&MAGIC);
+        output[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        output[6] = self.frame_type as u8;
+        output[7] = 0;
+        output[8..12].copy_from_slice(&self.epoch.to_be_bytes());
+        output[12..28].copy_from_slice(&self.session_id.to_be_bytes());
+        output[28..36].copy_from_slice(&self.packet_number.to_be_bytes());
+        output[36..44].copy_from_slice(
+            &self
+                .conversation_id
+                .map_or(0, ConversationId::get)
+                .to_be_bytes(),
+        );
+        output[44..48].copy_from_slice(&body_length.to_be_bytes());
+        Ok(output)
+    }
+
+    fn validate_fields(&self) -> Result<(), FrameError> {
+        if self.frame_type == FrameType::Data && self.conversation_id.is_none() {
+            return Err(FrameError::InvalidFrameFields);
+        }
+        if self.frame_type.is_handshake() && self.conversation_id.is_some() {
+            return Err(FrameError::InvalidFrameFields);
+        }
+        Ok(())
     }
 }
