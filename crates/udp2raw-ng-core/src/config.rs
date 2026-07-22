@@ -86,6 +86,9 @@ pub struct EngineConfig {
     pub max_conversations: usize,
     pub max_frame_payload: usize,
     pub conversation_idle_timeout: Duration,
+    pub heartbeat_interval: Duration,
+    pub session_timeout: Duration,
+    pub session_idle_timeout: Duration,
     pub handshake_retry_interval: Duration,
     pub handshake_timeout: Duration,
     pub handshake_max_attempts: usize,
@@ -127,6 +130,18 @@ impl EngineConfig {
         if self.conversation_idle_timeout.is_zero() {
             return Err(ConfigError::ZeroConversationIdleTimeout);
         }
+        if self.heartbeat_interval.is_zero() {
+            return Err(ConfigError::ZeroHeartbeatInterval);
+        }
+        if self.session_timeout.is_zero() {
+            return Err(ConfigError::ZeroSessionTimeout);
+        }
+        if self.heartbeat_interval >= self.session_timeout {
+            return Err(ConfigError::HeartbeatNotBelowSessionTimeout);
+        }
+        if self.session_idle_timeout.is_zero() {
+            return Err(ConfigError::ZeroSessionIdleTimeout);
+        }
         if self.handshake_retry_interval.is_zero() {
             return Err(ConfigError::ZeroHandshakeRetryInterval);
         }
@@ -164,6 +179,9 @@ impl Default for EngineConfig {
             max_conversations: 1024,
             max_frame_payload: crate::MAX_FRAME_PAYLOAD,
             conversation_idle_timeout: Duration::from_secs(180),
+            heartbeat_interval: Duration::from_millis(750),
+            session_timeout: Duration::from_secs(10),
+            session_idle_timeout: Duration::from_secs(300),
             handshake_retry_interval: Duration::from_millis(500),
             handshake_timeout: Duration::from_secs(10),
             handshake_max_attempts: 8,

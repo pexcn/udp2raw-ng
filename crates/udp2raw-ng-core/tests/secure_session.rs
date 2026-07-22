@@ -29,10 +29,17 @@ fn tunnel_frame(actions: &[TunnelAction]) -> (PeerId, Vec<u8>) {
 }
 
 fn establish(suite: CipherSuite) -> (ClientEngine, ServerEngine, PeerId, PeerId, SessionId) {
-    let now = Instant::now();
+    let (client_config, server_config) = configs(suite);
+    establish_with_configs(Instant::now(), client_config, server_config)
+}
+
+fn establish_with_configs(
+    now: Instant,
+    client_config: EngineConfig,
+    server_config: EngineConfig,
+) -> (ClientEngine, ServerEngine, PeerId, PeerId, SessionId) {
     let client_peer = PeerId::new(10);
     let server_peer = PeerId::new(20);
-    let (client_config, server_config) = configs(suite);
     let mut client = ClientEngine::new(client_config, psk(7), server_peer).expect("client");
     let mut server = ServerEngine::new(server_config, psk(7)).expect("server");
 
@@ -614,4 +621,307 @@ fn application_data_is_rejected_before_ready() {
         ),
         Err(EngineError::SessionNotReady)
     ));
+}
+
+#[test]
+fn authenticated_heartbeats_keep_client_and_server_sessions_alive() {
+    let now = Instant::now();
+    let (mut client_config, mut server_config) = configs(CipherSuite::ChaCha20Poly1305);
+    client_config.heartbeat_interval = Duration::from_millis(10);
+    client_config.session_timeout = Duration::from_millis(35);
+    server_config.heartbeat_interval = Duration::from_millis(10);
+    server_config.session_timeout = Duration::from_millis(35);
+    server_config.session_idle_timeout = Duration::from_millis(25);
+    let (mut client, mut server, client_peer, server_peer, session_id) =
+        establish_with_configs(now, client_config, server_config);
+
+    for elapsed in [10, 20, 30, 40] {
+        let at = now + Duration::from_millis(elapsed);
+        let heartbeat_actions = client
+            .handle(TunnelEvent::TimeAdvanced(at), at)
+            .expect("heartbeat timer");
+        let (_, heartbeat) = tunnel_frame(&heartbeat_actions);
+        assert_eq!(
+            udp2raw_ng_core::WireFrame::decode(&heartbeat)
+                .expect("heartbeat frame")
+                .frame_type,
+            udp2raw_ng_core::FrameType::Heartbeat
+        );
+
+        let reply_actions = server
+            .handle(
+                TunnelEvent::TunnelFrame {
+                    peer_id: client_peer,
+                    bytes: heartbeat,
+                },
+                at,
+            )
+            .expect("server heartbeat");
+        let (_, reply) = tunnel_frame(&reply_actions);
+        client
+            .handle(
+                TunnelEvent::TunnelFrame {
+                    peer_id: server_peer,
+                    bytes: reply,
+                },
+                at,
+            )
+            .expect("client heartbeat reply");
+
+        let server_expiry = server
+            .handle(
+                TunnelEvent::TimeAdvanced(at + Duration::from_millis(9)),
+                at + Duration::from_millis(9),
+            )
+            .expect("server idle timer");
+        assert!(!server_expiry.iter().any(|action| matches!(
+            action,
+            TunnelAction::SessionClosed { session_id: id, .. } if *id == session_id
+        )));
+        assert_eq!(client.state(), SessionState::Ready);
+        assert_eq!(server.session_state(session_id), Some(SessionState::Ready));
+    }
+}
+
+#[test]
+fn client_timeout_closes_old_session_and_starts_reconnect() {
+    let now = Instant::now();
+    let (mut client_config, server_config) = configs(CipherSuite::ChaCha20Poly1305);
+    client_config.heartbeat_interval = Duration::from_millis(10);
+    client_config.session_timeout = Duration::from_millis(30);
+    let (mut client, _, _, server_peer, old_session_id) =
+        establish_with_configs(now, client_config, server_config);
+
+    let timed_out_at = now + Duration::from_millis(30);
+    let actions = client
+        .handle(TunnelEvent::TimeAdvanced(timed_out_at), timed_out_at)
+        .expect("session timeout");
+
+    assert_eq!(client.state(), SessionState::Reconnecting);
+    assert_eq!(client.session_id(), None);
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionClosed { peer_id, session_id }
+            if *peer_id == server_peer && *session_id == old_session_id
+    )));
+    let (_, hello) = tunnel_frame(&actions);
+    assert_eq!(
+        udp2raw_ng_core::WireFrame::decode(&hello)
+            .expect("reconnect hello")
+            .frame_type,
+        udp2raw_ng_core::FrameType::ClientHello
+    );
+}
+
+#[test]
+fn manual_reconnect_preserves_conversations_across_new_session() {
+    let now = Instant::now();
+    let (mut client, mut server, client_peer, server_peer, old_session_id) =
+        establish(CipherSuite::ChaCha20Poly1305);
+    let local_peer: SocketAddr = "127.0.0.1:33000".parse().expect("address");
+    let request_actions = client
+        .handle(
+            TunnelEvent::ClientDatagram {
+                local_peer,
+                payload: b"before reconnect".to_vec(),
+            },
+            now,
+        )
+        .expect("initial request");
+    let conversation_id = request_actions
+        .iter()
+        .find_map(|action| match action {
+            TunnelAction::ConversationOpened {
+                conversation_id, ..
+            } => Some(*conversation_id),
+            _ => None,
+        })
+        .expect("conversation id");
+
+    let reconnect = client
+        .handle(TunnelEvent::Reconnect, now)
+        .expect("manual reconnect");
+    assert_eq!(client.state(), SessionState::Reconnecting);
+    assert!(reconnect.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionClosed { session_id, .. } if *session_id == old_session_id
+    )));
+    let (_, hello) = tunnel_frame(&reconnect);
+    let retry_actions = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: hello,
+            },
+            now,
+        )
+        .expect("reconnect challenge");
+    let (_, retry) = tunnel_frame(&retry_actions);
+    let cookie_hello_actions = client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: retry,
+            },
+            now,
+        )
+        .expect("reconnect cookie hello");
+    let (_, cookie_hello) = tunnel_frame(&cookie_hello_actions);
+    let server_hello_actions = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: cookie_hello,
+            },
+            now,
+        )
+        .expect("reconnect server hello");
+    let (_, server_hello) = tunnel_frame(&server_hello_actions);
+    let finish_actions = client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: server_hello,
+            },
+            now,
+        )
+        .expect("reconnect finish");
+    let new_session_id = client.session_id().expect("new session id");
+    assert_ne!(new_session_id, old_session_id);
+    let (_, finish) = tunnel_frame(&finish_actions);
+    let established = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: finish,
+            },
+            now,
+        )
+        .expect("reconnect establish");
+    let (_, ack) = tunnel_frame(&established);
+    client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: ack,
+            },
+            now,
+        )
+        .expect("reconnect ack");
+    assert_eq!(client.state(), SessionState::Ready);
+
+    let after = client
+        .handle(
+            TunnelEvent::ClientDatagram {
+                local_peer,
+                payload: b"after reconnect".to_vec(),
+            },
+            now,
+        )
+        .expect("request after reconnect");
+    assert!(
+        !after
+            .iter()
+            .any(|action| matches!(action, TunnelAction::ConversationOpened { .. }))
+    );
+    let (_, request) = tunnel_frame(&after);
+    let delivered = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: request,
+            },
+            now,
+        )
+        .expect("deliver after reconnect");
+    assert!(delivered.iter().any(|action| matches!(
+        action,
+        TunnelAction::DeliverToUpstream {
+            session_id,
+            conversation_id: id,
+            payload,
+        } if *session_id == new_session_id
+            && *id == conversation_id
+            && payload == b"after reconnect"
+    )));
+}
+
+#[test]
+fn reconnect_handshake_timeout_closes_client() {
+    let now = Instant::now();
+    let (mut client_config, server_config) = configs(CipherSuite::ChaCha20Poly1305);
+    client_config.handshake_retry_interval = Duration::from_millis(10);
+    client_config.handshake_timeout = Duration::from_millis(30);
+    client_config.handshake_max_attempts = 2;
+    let (mut client, _, _, _, old_session_id) =
+        establish_with_configs(now, client_config, server_config);
+    client
+        .handle(TunnelEvent::Reconnect, now)
+        .expect("start reconnect");
+
+    let closed_at = now + Duration::from_millis(30);
+    let actions = client
+        .handle(TunnelEvent::TimeAdvanced(closed_at), closed_at)
+        .expect("reconnect timeout");
+    assert_eq!(client.state(), SessionState::Closed);
+    assert_eq!(client.session_id(), None);
+    assert!(!actions.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionClosed { session_id, .. } if *session_id == old_session_id
+    )));
+}
+
+#[test]
+fn server_reclaims_idle_session_only_after_conversations_expire() {
+    let now = Instant::now();
+    let (client_config, mut server_config) = configs(CipherSuite::ChaCha20Poly1305);
+    server_config.conversation_idle_timeout = Duration::from_millis(40);
+    server_config.session_idle_timeout = Duration::from_millis(20);
+    let (mut client, mut server, client_peer, _, session_id) =
+        establish_with_configs(now, client_config, server_config);
+    let local_peer: SocketAddr = "127.0.0.1:33001".parse().expect("address");
+    let request_actions = client
+        .handle(
+            TunnelEvent::ClientDatagram {
+                local_peer,
+                payload: b"active conversation".to_vec(),
+            },
+            now,
+        )
+        .expect("request");
+    let (_, request) = tunnel_frame(&request_actions);
+    server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: request,
+            },
+            now,
+        )
+        .expect("open conversation");
+
+    let early = server
+        .handle(
+            TunnelEvent::TimeAdvanced(now + Duration::from_millis(20)),
+            now + Duration::from_millis(20),
+        )
+        .expect("early session timer");
+    assert!(early.is_empty());
+    assert_eq!(server.session_state(session_id), Some(SessionState::Ready));
+
+    let expired = server
+        .handle(
+            TunnelEvent::TimeAdvanced(now + Duration::from_millis(40)),
+            now + Duration::from_millis(40),
+        )
+        .expect("conversation and session expiry");
+    assert!(expired.iter().any(|action| matches!(
+        action,
+        TunnelAction::ConversationClosed { session_id: Some(id), .. } if *id == session_id
+    )));
+    assert!(expired.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionClosed { session_id: id, .. } if *id == session_id
+    )));
+    assert_eq!(server.session_state(session_id), None);
 }

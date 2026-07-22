@@ -20,6 +20,7 @@ pub enum SessionState {
     Idle,
     Handshaking,
     Ready,
+    Reconnecting,
     Closed,
 }
 
@@ -27,6 +28,7 @@ pub enum SessionState {
 #[derive(Debug)]
 pub enum TunnelEvent {
     Start,
+    Reconnect,
     ClientDatagram {
         local_peer: SocketAddr,
         payload: Vec<u8>,
@@ -68,6 +70,10 @@ pub enum TunnelAction {
         session_id: SessionId,
         cipher_suite: CipherSuite,
     },
+    SessionClosed {
+        peer_id: PeerId,
+        session_id: SessionId,
+    },
     ConversationOpened {
         session_id: Option<SessionId>,
         conversation_id: ConversationId,
@@ -105,6 +111,8 @@ struct ClientSession {
     id: SessionId,
     sealer: RecordSealer,
     opener: RecordOpener,
+    last_received_at: Instant,
+    last_heartbeat_sent_at: Instant,
 }
 
 pub struct ClientEngine {
@@ -151,6 +159,7 @@ impl ClientEngine {
     ) -> Result<Vec<TunnelAction>, EngineError> {
         match event {
             TunnelEvent::Start => self.start(now),
+            TunnelEvent::Reconnect => self.reconnect(now),
             TunnelEvent::ClientDatagram {
                 local_peer,
                 payload,
@@ -174,6 +183,21 @@ impl ClientEngine {
         if self.state != SessionState::Idle {
             return Err(EngineError::SessionNotReady);
         }
+        self.begin_handshake(now, SessionState::Handshaking)
+    }
+
+    fn reconnect(&mut self, now: Instant) -> Result<Vec<TunnelAction>, EngineError> {
+        if self.state != SessionState::Ready {
+            return Err(EngineError::SessionNotReady);
+        }
+        Ok(self.begin_reconnect(now))
+    }
+
+    fn begin_handshake(
+        &mut self,
+        now: Instant,
+        state: SessionState,
+    ) -> Result<Vec<TunnelAction>, EngineError> {
         let hello = ClientHello::generate(self.config.cipher_suite)?;
         let bytes = hello.frame().encode()?;
         self.handshake = Some(ClientHandshake {
@@ -183,7 +207,7 @@ impl ClientEngine {
             last_sent_at: now,
             attempts: 1,
         });
-        self.state = SessionState::Handshaking;
+        self.state = state;
         Ok(vec![
             TunnelAction::SendTunnelFrame {
                 peer_id: self.server_peer,
@@ -255,9 +279,10 @@ impl ClientEngine {
         if envelope.frame_type == FrameType::ServerHello {
             return self.handle_server_hello(envelope, now);
         }
-        if self.state != SessionState::Ready && self.state != SessionState::Handshaking {
+        if self.state != SessionState::Ready && !self.is_handshaking() {
             return Err(EngineError::SessionNotReady);
         }
+        let was_handshaking = self.is_handshaking();
         let session = self.session.as_mut().ok_or(EngineError::SessionNotReady)?;
         let frame = match session.opener.open(&bytes) {
             Ok(frame) => frame,
@@ -270,19 +295,28 @@ impl ClientEngine {
             Err(error) => return Err(error.into()),
         };
         if frame.frame_type == FrameType::HandshakeAck {
-            if self.state != SessionState::Handshaking {
+            if !was_handshaking {
                 return Ok(Vec::new());
             }
             self.handshake = None;
             self.state = SessionState::Ready;
-            return Ok(vec![TunnelAction::SessionEstablished {
-                peer_id: self.server_peer,
-                session_id: session.id,
-                cipher_suite: self.config.cipher_suite,
-            }]);
+            session.last_received_at = now;
+            session.last_heartbeat_sent_at = now;
+            return Ok(vec![
+                TunnelAction::SessionEstablished {
+                    peer_id: self.server_peer,
+                    session_id: session.id,
+                    cipher_suite: self.config.cipher_suite,
+                },
+                TunnelAction::ScheduleTimer(self.config.heartbeat_interval),
+            ]);
         }
         if self.state != SessionState::Ready {
             return Err(EngineError::SessionNotReady);
+        }
+        session.last_received_at = now;
+        if frame.frame_type == FrameType::Heartbeat {
+            return Ok(Vec::new());
         }
         if frame.frame_type != FrameType::Data {
             return Ok(Vec::new());
@@ -308,7 +342,7 @@ impl ClientEngine {
         frame: WireFrame,
         now: Instant,
     ) -> Result<Vec<TunnelAction>, EngineError> {
-        if self.state != SessionState::Handshaking {
+        if !self.is_handshaking() {
             return Err(EngineError::Handshake(
                 crate::HandshakeError::UnexpectedMessage,
             ));
@@ -341,7 +375,7 @@ impl ClientEngine {
         frame: WireFrame,
         now: Instant,
     ) -> Result<Vec<TunnelAction>, EngineError> {
-        if self.state != SessionState::Handshaking {
+        if !self.is_handshaking() {
             return Err(EngineError::Handshake(
                 crate::HandshakeError::UnexpectedMessage,
             ));
@@ -398,6 +432,8 @@ impl ClientEngine {
                 server_to_client,
                 self.config.replay_window_size,
             ),
+            last_received_at: now,
+            last_heartbeat_sent_at: now,
         });
         handshake.phase = ClientHandshakePhase::AwaitingServerAck {
             server_hello,
@@ -416,7 +452,7 @@ impl ClientEngine {
 
     fn expire(&mut self, now: Instant) -> Vec<TunnelAction> {
         let mut actions = Vec::new();
-        if self.state == SessionState::Handshaking {
+        if self.is_handshaking() {
             let should_close = self.handshake.as_ref().is_some_and(|handshake| {
                 now.saturating_duration_since(handshake.started_at) >= self.config.handshake_timeout
                     || (handshake.attempts >= self.config.handshake_max_attempts
@@ -424,9 +460,15 @@ impl ClientEngine {
                             >= self.config.handshake_retry_interval)
             });
             if should_close {
+                let closed_session = self.session.take().map(|session| session.id);
                 self.handshake = None;
-                self.session = None;
                 self.state = SessionState::Closed;
+                if let Some(session_id) = closed_session {
+                    actions.push(TunnelAction::SessionClosed {
+                        peer_id: self.server_peer,
+                        session_id,
+                    });
+                }
             } else if let Some(handshake) = self.handshake.as_mut()
                 && now.saturating_duration_since(handshake.last_sent_at)
                     >= self.config.handshake_retry_interval
@@ -450,6 +492,38 @@ impl ClientEngine {
                     ));
                 }
             }
+        } else if self.state == SessionState::Ready {
+            let timed_out = self.session.as_ref().is_some_and(|session| {
+                now.saturating_duration_since(session.last_received_at)
+                    >= self.config.session_timeout
+            });
+            if timed_out {
+                actions.extend(self.begin_reconnect(now));
+            } else if self.session.as_ref().is_some_and(|session| {
+                now.saturating_duration_since(session.last_heartbeat_sent_at)
+                    >= self.config.heartbeat_interval
+            }) {
+                let heartbeat = self
+                    .session
+                    .as_mut()
+                    .expect("ready client has a session")
+                    .sealer
+                    .seal(FrameType::Heartbeat, None, &[]);
+                match heartbeat {
+                    Ok(bytes) => {
+                        self.session
+                            .as_mut()
+                            .expect("ready client has a session")
+                            .last_heartbeat_sent_at = now;
+                        actions.push(TunnelAction::SendTunnelFrame {
+                            peer_id: self.server_peer,
+                            bytes,
+                        });
+                        actions.push(TunnelAction::ScheduleTimer(self.config.heartbeat_interval));
+                    }
+                    Err(_) => actions.extend(self.begin_reconnect(now)),
+                }
+            }
         }
         let timeout = self.config.conversation_idle_timeout;
         let expired: Vec<_> = self
@@ -469,6 +543,29 @@ impl ClientEngine {
             }
         }));
         actions
+    }
+
+    fn begin_reconnect(&mut self, now: Instant) -> Vec<TunnelAction> {
+        let mut actions = Vec::new();
+        if let Some(session) = self.session.take() {
+            actions.push(TunnelAction::SessionClosed {
+                peer_id: self.server_peer,
+                session_id: session.id,
+            });
+        }
+        self.handshake = None;
+        match self.begin_handshake(now, SessionState::Reconnecting) {
+            Ok(handshake_actions) => actions.extend(handshake_actions),
+            Err(_) => self.state = SessionState::Closed,
+        }
+        actions
+    }
+
+    fn is_handshaking(&self) -> bool {
+        matches!(
+            self.state,
+            SessionState::Handshaking | SessionState::Reconnecting
+        )
     }
 
     fn close(&mut self, id: ConversationId) -> Option<TunnelAction> {
@@ -495,6 +592,8 @@ struct ServerSession {
     handshake_ack: Vec<u8>,
     client_finish: Vec<u8>,
     conversations: HashMap<ConversationId, Instant>,
+    last_activity: Instant,
+    expires_at: Instant,
 }
 
 pub struct ServerEngine {
@@ -546,7 +645,7 @@ impl ServerEngine {
                 session_id,
                 conversation_id,
                 payload,
-            } => self.handle_upstream(session_id, conversation_id, payload),
+            } => self.handle_upstream(session_id, conversation_id, payload, now),
             TunnelEvent::CloseConversation {
                 session_id,
                 conversation_id,
@@ -555,7 +654,7 @@ impl ServerEngine {
                 self.close(session_id, conversation_id)
             }
             TunnelEvent::TimeAdvanced(at) => Ok(self.expire(at)),
-            TunnelEvent::Start | TunnelEvent::ClientDatagram { .. } => {
+            TunnelEvent::Start | TunnelEvent::Reconnect | TunnelEvent::ClientDatagram { .. } => {
                 Err(EngineError::InvalidRole)
             }
         }
@@ -570,7 +669,7 @@ impl ServerEngine {
         let frame = WireFrame::decode(&bytes)?;
         match frame.frame_type {
             FrameType::ClientHello => self.handle_client_hello(peer_id, frame, now),
-            FrameType::ClientFinish => self.handle_client_finish(peer_id, frame),
+            FrameType::ClientFinish => self.handle_client_finish(peer_id, frame, now),
             _ if frame.frame_type.is_protected() => {
                 self.handle_record(peer_id, frame.session_id, bytes, now)
             }
@@ -669,6 +768,7 @@ impl ServerEngine {
         &mut self,
         peer_id: PeerId,
         frame: WireFrame,
+        now: Instant,
     ) -> Result<Vec<TunnelAction>, EngineError> {
         if let Some(session) = self.sessions.get(&frame.session_id) {
             if session.peer_id != peer_id {
@@ -734,6 +834,8 @@ impl ServerEngine {
                 handshake_ack: handshake_ack.clone(),
                 client_finish,
                 conversations: HashMap::new(),
+                last_activity: now,
+                expires_at: now + self.config.session_idle_timeout,
             },
         );
         self.pending.remove(&frame.session_id);
@@ -747,6 +849,7 @@ impl ServerEngine {
                 session_id: frame.session_id,
                 cipher_suite: self.config.cipher_suite,
             },
+            TunnelAction::ScheduleTimer(self.config.session_idle_timeout),
         ])
     }
 
@@ -765,6 +868,15 @@ impl ServerEngine {
             return Err(EngineError::UnexpectedPeer);
         }
         let frame = session.opener.open(&bytes)?;
+        session.last_activity = now;
+        session.expires_at = now + self.config.session_idle_timeout;
+        if frame.frame_type == FrameType::Heartbeat {
+            let bytes = session.sealer.seal(FrameType::Heartbeat, None, &[])?;
+            return Ok(vec![
+                TunnelAction::SendTunnelFrame { peer_id, bytes },
+                TunnelAction::ScheduleTimer(self.config.session_idle_timeout),
+            ]);
+        }
         if frame.frame_type != FrameType::Data {
             return Ok(Vec::new());
         }
@@ -790,6 +902,9 @@ impl ServerEngine {
             conversation_id,
             payload: frame.plaintext,
         });
+        actions.push(TunnelAction::ScheduleTimer(
+            self.config.session_idle_timeout,
+        ));
         Ok(actions)
     }
 
@@ -798,6 +913,7 @@ impl ServerEngine {
         session_id: SessionId,
         conversation_id: ConversationId,
         payload: Vec<u8>,
+        now: Instant,
     ) -> Result<Vec<TunnelAction>, EngineError> {
         if payload.len() > self.config.max_frame_payload {
             return Err(EngineError::PayloadTooLarge);
@@ -809,13 +925,18 @@ impl ServerEngine {
         if !session.conversations.contains_key(&conversation_id) {
             return Err(EngineError::UnknownConversation);
         }
+        session.last_activity = now;
+        session.expires_at = now + self.config.session_idle_timeout;
         let bytes = session
             .sealer
             .seal(FrameType::Data, Some(conversation_id), &payload)?;
-        Ok(vec![TunnelAction::SendTunnelFrame {
-            peer_id: session.peer_id,
-            bytes,
-        }])
+        Ok(vec![
+            TunnelAction::SendTunnelFrame {
+                peer_id: session.peer_id,
+                bytes,
+            },
+            TunnelAction::ScheduleTimer(self.config.session_idle_timeout),
+        ])
     }
 
     fn close(
@@ -860,6 +981,24 @@ impl ServerEngine {
                     conversation_id,
                 });
             }
+        }
+        let session_timeout = self.config.session_idle_timeout;
+        let expired_sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, session)| {
+                (session.conversations.is_empty()
+                    && now >= session.expires_at
+                    && now.saturating_duration_since(session.last_activity) >= session_timeout)
+                    .then_some((*session_id, session.peer_id))
+            })
+            .collect();
+        for (session_id, peer_id) in expired_sessions {
+            self.sessions.remove(&session_id);
+            actions.push(TunnelAction::SessionClosed {
+                peer_id,
+                session_id,
+            });
         }
         actions
     }

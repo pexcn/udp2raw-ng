@@ -8,6 +8,14 @@ pub enum ConfigError {
     ZeroConversationLimit,
     #[error("conversation idle timeout must be greater than zero")]
     ZeroConversationIdleTimeout,
+    #[error("heartbeat interval must be greater than zero")]
+    ZeroHeartbeatInterval,
+    #[error("session timeout must be greater than zero")]
+    ZeroSessionTimeout,
+    #[error("heartbeat interval must be shorter than the session timeout")]
+    HeartbeatNotBelowSessionTimeout,
+    #[error("server session idle timeout must be greater than zero")]
+    ZeroSessionIdleTimeout,
     #[error("handshake timeout must be greater than zero")]
     ZeroHandshakeTimeout,
     #[error("handshake retry interval must be greater than zero")]
