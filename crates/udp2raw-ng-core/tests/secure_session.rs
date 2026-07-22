@@ -28,6 +28,16 @@ fn tunnel_frame(actions: &[TunnelAction]) -> (PeerId, Vec<u8>) {
         .expect("send action")
 }
 
+fn tunnel_frames(actions: &[TunnelAction]) -> Vec<(PeerId, Vec<u8>)> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            TunnelAction::SendTunnelFrame { peer_id, bytes } => Some((*peer_id, bytes.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 fn establish(suite: CipherSuite) -> (ClientEngine, ServerEngine, PeerId, PeerId, SessionId) {
     let (client_config, server_config) = configs(suite);
     establish_with_configs(Instant::now(), client_config, server_config)
@@ -99,7 +109,8 @@ fn establish_with_configs(
         action,
         TunnelAction::SessionEstablished { session_id: id, .. } if *id == session_id
     )));
-    let (_, ack) = tunnel_frame(&established);
+    let frames = tunnel_frames(&established);
+    let (_, ack) = frames.first().cloned().expect("handshake ack");
     let client_established = client
         .handle(
             TunnelEvent::TunnelFrame {
@@ -113,9 +124,94 @@ fn establish_with_configs(
         action,
         TunnelAction::SessionEstablished { session_id: id, .. } if *id == session_id
     )));
+    for (_, bytes) in frames.into_iter().skip(1) {
+        client
+            .handle(
+                TunnelEvent::TunnelFrame {
+                    peer_id: server_peer,
+                    bytes,
+                },
+                now,
+            )
+            .expect("post-handshake protected frame");
+    }
     assert_eq!(client.state(), SessionState::Ready);
     assert_eq!(server.session_state(session_id), Some(SessionState::Ready));
     (client, server, client_peer, server_peer, session_id)
+}
+
+fn reconnect(
+    client: &mut ClientEngine,
+    server: &mut ServerEngine,
+    client_peer: PeerId,
+    server_peer: PeerId,
+    now: Instant,
+) -> (SessionId, Vec<TunnelAction>, Vec<TunnelAction>) {
+    let reconnect = client
+        .handle(TunnelEvent::Reconnect, now)
+        .expect("start reconnect");
+    let (_, hello) = tunnel_frame(&reconnect);
+    let retry_actions = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: hello,
+            },
+            now,
+        )
+        .expect("reconnect challenge");
+    let (_, retry) = tunnel_frame(&retry_actions);
+    let cookie_hello_actions = client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: retry,
+            },
+            now,
+        )
+        .expect("reconnect cookie hello");
+    let (_, cookie_hello) = tunnel_frame(&cookie_hello_actions);
+    let server_hello_actions = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: cookie_hello,
+            },
+            now,
+        )
+        .expect("reconnect server hello");
+    let (_, server_hello) = tunnel_frame(&server_hello_actions);
+    let finish_actions = client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: server_hello,
+            },
+            now,
+        )
+        .expect("reconnect finish");
+    let new_session_id = client.session_id().expect("new session id");
+    let (_, finish) = tunnel_frame(&finish_actions);
+    let server_established = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: finish,
+            },
+            now,
+        )
+        .expect("reconnect establish");
+    let (_, ack) = tunnel_frame(&server_established);
+    let client_established = client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: ack,
+            },
+            now,
+        )
+        .expect("reconnect ack");
+    (new_session_id, server_established, client_established)
 }
 
 #[test]
@@ -714,7 +810,7 @@ fn client_timeout_closes_old_session_and_starts_reconnect() {
 }
 
 #[test]
-fn manual_reconnect_preserves_conversations_across_new_session() {
+fn manual_reconnect_resumes_server_conversation_across_new_session() {
     let now = Instant::now();
     let (mut client, mut server, client_peer, server_peer, old_session_id) =
         establish(CipherSuite::ChaCha20Poly1305);
@@ -737,78 +833,52 @@ fn manual_reconnect_preserves_conversations_across_new_session() {
             _ => None,
         })
         .expect("conversation id");
-
-    let reconnect = client
-        .handle(TunnelEvent::Reconnect, now)
-        .expect("manual reconnect");
-    assert_eq!(client.state(), SessionState::Reconnecting);
-    assert!(reconnect.iter().any(|action| matches!(
-        action,
-        TunnelAction::SessionClosed { session_id, .. } if *session_id == old_session_id
-    )));
-    let (_, hello) = tunnel_frame(&reconnect);
-    let retry_actions = server
+    let (_, request) = tunnel_frame(&request_actions);
+    let opened = server
         .handle(
             TunnelEvent::TunnelFrame {
                 peer_id: client_peer,
-                bytes: hello,
+                bytes: request,
             },
             now,
         )
-        .expect("reconnect challenge");
-    let (_, retry) = tunnel_frame(&retry_actions);
-    let cookie_hello_actions = client
-        .handle(
-            TunnelEvent::TunnelFrame {
-                peer_id: server_peer,
-                bytes: retry,
-            },
-            now,
-        )
-        .expect("reconnect cookie hello");
-    let (_, cookie_hello) = tunnel_frame(&cookie_hello_actions);
-    let server_hello_actions = server
-        .handle(
-            TunnelEvent::TunnelFrame {
-                peer_id: client_peer,
-                bytes: cookie_hello,
-            },
-            now,
-        )
-        .expect("reconnect server hello");
-    let (_, server_hello) = tunnel_frame(&server_hello_actions);
-    let finish_actions = client
-        .handle(
-            TunnelEvent::TunnelFrame {
-                peer_id: server_peer,
-                bytes: server_hello,
-            },
-            now,
-        )
-        .expect("reconnect finish");
-    let new_session_id = client.session_id().expect("new session id");
-    assert_ne!(new_session_id, old_session_id);
-    let (_, finish) = tunnel_frame(&finish_actions);
-    let established = server
-        .handle(
-            TunnelEvent::TunnelFrame {
-                peer_id: client_peer,
-                bytes: finish,
-            },
-            now,
-        )
-        .expect("reconnect establish");
-    let (_, ack) = tunnel_frame(&established);
+        .expect("open conversation and issue credential");
+    let credential = tunnel_frames(&opened)
+        .into_iter()
+        .next()
+        .expect("resumption credential");
     client
         .handle(
             TunnelEvent::TunnelFrame {
                 peer_id: server_peer,
-                bytes: ack,
+                bytes: credential.1,
             },
             now,
         )
-        .expect("reconnect ack");
+        .expect("store resumption credential");
+
+    let (new_session_id, server_established, client_established) =
+        reconnect(&mut client, &mut server, client_peer, server_peer, now);
+    assert_ne!(new_session_id, old_session_id);
     assert_eq!(client.state(), SessionState::Ready);
+    assert!(server_established.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionEstablished { session_id, resumed: true, .. }
+            if *session_id == new_session_id
+    )));
+    assert!(server_established.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionResumed {
+            old_session_id: old,
+            new_session_id: new,
+            ..
+        } if *old == old_session_id && *new == new_session_id
+    )));
+    assert!(client_established.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionEstablished { resumed: true, .. }
+    )));
+    assert_eq!(server.session_state(old_session_id), None);
 
     let after = client
         .handle(
@@ -844,6 +914,128 @@ fn manual_reconnect_preserves_conversations_across_new_session() {
             && *id == conversation_id
             && payload == b"after reconnect"
     )));
+    assert!(
+        !delivered
+            .iter()
+            .any(|action| matches!(action, TunnelAction::ConversationOpened { .. }))
+    );
+
+    let response_actions = server
+        .handle(
+            TunnelEvent::ServerDatagram {
+                session_id: new_session_id,
+                conversation_id,
+                payload: b"response after migration".to_vec(),
+            },
+            now,
+        )
+        .expect("upstream response after migration");
+    let (_, response) = tunnel_frame(&response_actions);
+    let client_delivery = client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: response,
+            },
+            now,
+        )
+        .expect("client receives migrated response");
+    assert!(client_delivery.iter().any(|action| matches!(
+        action,
+        TunnelAction::DeliverToClient { payload, .. }
+            if payload == b"response after migration"
+    )));
+}
+
+#[test]
+fn expired_resumption_credential_falls_back_and_closes_stale_client_mapping() {
+    let now = Instant::now();
+    let (mut client_config, mut server_config) = configs(CipherSuite::ChaCha20Poly1305);
+    client_config.conversation_idle_timeout = Duration::from_secs(5);
+    server_config.conversation_idle_timeout = Duration::from_secs(5);
+    server_config.resumption_lifetime = Duration::from_millis(20);
+    let (mut client, mut server, client_peer, server_peer, old_session_id) =
+        establish_with_configs(now, client_config, server_config);
+    let local_peer: SocketAddr = "127.0.0.1:33002".parse().expect("address");
+    let request_actions = client
+        .handle(
+            TunnelEvent::ClientDatagram {
+                local_peer,
+                payload: b"credential source".to_vec(),
+            },
+            now,
+        )
+        .expect("request");
+    let conversation_id = request_actions
+        .iter()
+        .find_map(|action| match action {
+            TunnelAction::ConversationOpened {
+                conversation_id, ..
+            } => Some(*conversation_id),
+            _ => None,
+        })
+        .expect("conversation");
+    let (_, request) = tunnel_frame(&request_actions);
+    let opened = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: request,
+            },
+            now,
+        )
+        .expect("issue credential");
+    let (_, credential) = tunnel_frame(&opened);
+    client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: credential,
+            },
+            now,
+        )
+        .expect("store credential");
+
+    let reconnect_at = now + Duration::from_millis(21);
+    let (new_session_id, server_established, client_established) = reconnect(
+        &mut client,
+        &mut server,
+        client_peer,
+        server_peer,
+        reconnect_at,
+    );
+    assert_ne!(new_session_id, old_session_id);
+    assert!(server_established.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionEstablished { resumed: false, .. }
+    )));
+    assert!(
+        !server_established
+            .iter()
+            .any(|action| matches!(action, TunnelAction::SessionResumed { .. }))
+    );
+    assert!(client_established.iter().any(|action| matches!(
+        action,
+        TunnelAction::ConversationClosed {
+            session_id: None,
+            conversation_id: id,
+        } if *id == conversation_id
+    )));
+
+    let after = client
+        .handle(
+            TunnelEvent::ClientDatagram {
+                local_peer,
+                payload: b"fresh conversation".to_vec(),
+            },
+            reconnect_at,
+        )
+        .expect("fresh request");
+    assert!(after.iter().any(|action| matches!(
+        action,
+        TunnelAction::ConversationOpened { conversation_id: id, .. }
+            if *id != conversation_id
+    )));
 }
 
 #[test]
@@ -872,7 +1064,7 @@ fn reconnect_handshake_timeout_closes_client() {
 }
 
 #[test]
-fn server_reclaims_idle_session_only_after_conversations_expire() {
+fn server_moves_idle_session_to_resumable_state_before_conversation_expiry() {
     let now = Instant::now();
     let (client_config, mut server_config) = configs(CipherSuite::ChaCha20Poly1305);
     server_config.conversation_idle_timeout = Duration::from_millis(40);
@@ -906,8 +1098,16 @@ fn server_reclaims_idle_session_only_after_conversations_expire() {
             now + Duration::from_millis(20),
         )
         .expect("early session timer");
-    assert!(early.is_empty());
-    assert_eq!(server.session_state(session_id), Some(SessionState::Ready));
+    assert!(early.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionClosed { session_id: id, .. } if *id == session_id
+    )));
+    assert!(
+        !early
+            .iter()
+            .any(|action| matches!(action, TunnelAction::ConversationClosed { .. }))
+    );
+    assert_eq!(server.session_state(session_id), None);
 
     let expired = server
         .handle(
@@ -915,13 +1115,6 @@ fn server_reclaims_idle_session_only_after_conversations_expire() {
             now + Duration::from_millis(40),
         )
         .expect("conversation and session expiry");
-    assert!(expired.iter().any(|action| matches!(
-        action,
-        TunnelAction::ConversationClosed { session_id: Some(id), .. } if *id == session_id
-    )));
-    assert!(expired.iter().any(|action| matches!(
-        action,
-        TunnelAction::SessionClosed { session_id: id, .. } if *id == session_id
-    )));
+    assert!(expired.is_empty());
     assert_eq!(server.session_state(session_id), None);
 }

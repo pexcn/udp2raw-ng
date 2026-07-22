@@ -17,6 +17,7 @@ pub enum FrameType {
     Heartbeat = 17,
     Close = 18,
     HandshakeAck = 19,
+    ResumptionCredential = 20,
     MtuProbe = 32,
     MtuAck = 33,
 }
@@ -32,7 +33,11 @@ impl FrameType {
     pub(crate) const fn is_protected(self) -> bool {
         matches!(
             self,
-            Self::Data | Self::Heartbeat | Self::Close | Self::HandshakeAck
+            Self::Data
+                | Self::Heartbeat
+                | Self::Close
+                | Self::HandshakeAck
+                | Self::ResumptionCredential
         )
     }
 }
@@ -50,6 +55,7 @@ impl TryFrom<u8> for FrameType {
             17 => Ok(Self::Heartbeat),
             18 => Ok(Self::Close),
             19 => Ok(Self::HandshakeAck),
+            20 => Ok(Self::ResumptionCredential),
             32 => Ok(Self::MtuProbe),
             33 => Ok(Self::MtuAck),
             _ => Err(FrameError::UnknownFrameType(value)),

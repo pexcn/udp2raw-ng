@@ -6,7 +6,8 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{Direction, SessionKeys};
 use crate::handshake::{
-    ClientFinish, ClientHello, HelloRetry, ServerHello, session_keys, verify_cookie,
+    ClientFinish, ClientHello, HelloRetry, ResumptionCredential, ServerHello,
+    issue_resumption_credential, session_keys, verify_cookie, verify_resumption_credential,
 };
 use crate::record::{RecordOpener, RecordSealer};
 use crate::{
@@ -69,6 +70,12 @@ pub enum TunnelAction {
         peer_id: PeerId,
         session_id: SessionId,
         cipher_suite: CipherSuite,
+        resumed: bool,
+    },
+    SessionResumed {
+        peer_id: PeerId,
+        old_session_id: SessionId,
+        new_session_id: SessionId,
     },
     SessionClosed {
         peer_id: PeerId,
@@ -89,6 +96,7 @@ pub enum TunnelAction {
 struct ClientConversation {
     id: ConversationId,
     last_activity: Instant,
+    resumption: Option<(SessionId, ResumptionCredential)>,
 }
 
 enum ClientHandshakePhase {
@@ -113,6 +121,7 @@ struct ClientSession {
     opener: RecordOpener,
     last_received_at: Instant,
     last_heartbeat_sent_at: Instant,
+    resumed: bool,
 }
 
 pub struct ClientEngine {
@@ -198,7 +207,24 @@ impl ClientEngine {
         now: Instant,
         state: SessionState,
     ) -> Result<Vec<TunnelAction>, EngineError> {
-        let hello = ClientHello::generate(self.config.cipher_suite)?;
+        let resumption = if state == SessionState::Reconnecting {
+            let mut credentials = self.by_peer.values().filter_map(|conversation| {
+                conversation
+                    .resumption
+                    .map(|(session_id, credential)| (conversation.id, session_id, credential))
+            });
+            credentials.next().and_then(|(_, session_id, credential)| {
+                (self.by_peer.values().all(|conversation| {
+                    conversation
+                        .resumption
+                        .is_some_and(|(candidate, _)| candidate == session_id)
+                }))
+                .then_some(credential)
+            })
+        } else {
+            None
+        };
+        let hello = ClientHello::generate(self.config.cipher_suite, resumption)?;
         let bytes = hello.frame().encode()?;
         self.handshake = Some(ClientHandshake {
             hello,
@@ -243,6 +269,7 @@ impl ClientEngine {
                 ClientConversation {
                     id,
                     last_activity: now,
+                    resumption: None,
                 },
             );
             self.by_id.insert(id, local_peer);
@@ -298,24 +325,64 @@ impl ClientEngine {
             if !was_handshaking {
                 return Ok(Vec::new());
             }
+            let attempted_resumption = self
+                .handshake
+                .as_ref()
+                .is_some_and(|handshake| handshake.hello.resumption.is_some());
+            let resumed = session.resumed;
             self.handshake = None;
             self.state = SessionState::Ready;
             session.last_received_at = now;
             session.last_heartbeat_sent_at = now;
-            return Ok(vec![
-                TunnelAction::SessionEstablished {
-                    peer_id: self.server_peer,
-                    session_id: session.id,
-                    cipher_suite: self.config.cipher_suite,
-                },
-                TunnelAction::ScheduleTimer(self.config.heartbeat_interval),
-            ]);
+            let mut actions = Vec::new();
+            if attempted_resumption && !resumed {
+                let stale: Vec<_> = self
+                    .by_peer
+                    .drain()
+                    .map(|(_, conversation)| conversation.id)
+                    .collect();
+                self.by_id.clear();
+                actions.extend(stale.into_iter().map(|conversation_id| {
+                    TunnelAction::ConversationClosed {
+                        session_id: None,
+                        conversation_id,
+                    }
+                }));
+            }
+            actions.push(TunnelAction::SessionEstablished {
+                peer_id: self.server_peer,
+                session_id: session.id,
+                cipher_suite: self.config.cipher_suite,
+                resumed,
+            });
+            actions.push(TunnelAction::ScheduleTimer(self.config.heartbeat_interval));
+            return Ok(actions);
         }
         if self.state != SessionState::Ready {
             return Err(EngineError::SessionNotReady);
         }
         session.last_received_at = now;
         if frame.frame_type == FrameType::Heartbeat {
+            return Ok(Vec::new());
+        }
+        if frame.frame_type == FrameType::ResumptionCredential {
+            let id = frame
+                .conversation_id
+                .ok_or(EngineError::UnknownConversation)?;
+            let local_peer = *self
+                .by_id
+                .get(&id)
+                .ok_or(EngineError::UnknownConversation)?;
+            let credential = ResumptionCredential::from_bytes(
+                frame
+                    .plaintext
+                    .try_into()
+                    .map_err(|_| crate::HandshakeError::InvalidResumptionCredential)?,
+            );
+            if let Some(conversation) = self.by_peer.get_mut(&local_peer) {
+                conversation.resumption = Some((session.id, credential));
+                conversation.last_activity = now;
+            }
             return Ok(Vec::new());
         }
         if frame.frame_type != FrameType::Data {
@@ -434,6 +501,7 @@ impl ClientEngine {
             ),
             last_received_at: now,
             last_heartbeat_sent_at: now,
+            resumed: server_hello.resumed,
         });
         handshake.phase = ClientHandshakePhase::AwaitingServerAck {
             server_hello,
@@ -578,11 +646,13 @@ impl ClientEngine {
     }
 }
 
+#[derive(Clone)]
 struct PendingHandshake {
     peer_id: PeerId,
     created_at: Instant,
     client_hello: ClientHello,
     server_hello: ServerHello,
+    resume_from: Option<SessionId>,
 }
 
 struct ServerSession {
@@ -592,7 +662,13 @@ struct ServerSession {
     handshake_ack: Vec<u8>,
     client_finish: Vec<u8>,
     conversations: HashMap<ConversationId, Instant>,
+    resumption_credential: Option<(ResumptionCredential, Instant)>,
     last_activity: Instant,
+    expires_at: Instant,
+}
+
+struct ResumableSession {
+    conversations: HashMap<ConversationId, Instant>,
     expires_at: Instant,
 }
 
@@ -603,6 +679,7 @@ pub struct ServerEngine {
     clock_origin: Option<Instant>,
     pending: HashMap<SessionId, PendingHandshake>,
     sessions: HashMap<SessionId, ServerSession>,
+    resumable: HashMap<SessionId, ResumableSession>,
 }
 
 impl ServerEngine {
@@ -621,6 +698,7 @@ impl ServerEngine {
             clock_origin: None,
             pending: HashMap::new(),
             sessions: HashMap::new(),
+            resumable: HashMap::new(),
         })
     }
 
@@ -747,7 +825,31 @@ impl ServerEngine {
                 break candidate;
             }
         };
-        let server_hello = ServerHello::create(&self.psk, &hello, session_id)?;
+        let now_ms = self.now_ms(now);
+        let resume_from = hello.resumption.and_then(|credential| {
+            verify_resumption_credential(self.cookie_secret.as_ref(), credential, now_ms)
+                .ok()
+                .and_then(|(old_session_id, conversation_id)| {
+                    let active_matches =
+                        self.sessions.get(&old_session_id).is_some_and(|session| {
+                            session.conversations.contains_key(&conversation_id)
+                                && session.resumption_credential.is_some()
+                        });
+                    let resumable_matches = self
+                        .resumable
+                        .get(&old_session_id)
+                        .is_some_and(|state| state.conversations.contains_key(&conversation_id));
+                    (active_matches || resumable_matches).then_some(old_session_id)
+                })
+        });
+        let resume_from = resume_from.filter(|old_session_id| {
+            !self
+                .pending
+                .values()
+                .any(|pending| pending.resume_from == Some(*old_session_id))
+        });
+        let server_hello =
+            ServerHello::create(&self.psk, &hello, session_id, resume_from.is_some())?;
         let bytes = server_hello.frame(session_id).encode()?;
         self.pending.insert(
             session_id,
@@ -756,6 +858,7 @@ impl ServerEngine {
                 created_at: now,
                 client_hello: hello,
                 server_hello,
+                resume_from,
             },
         );
         Ok(vec![
@@ -784,15 +887,19 @@ impl ServerEngine {
                 bytes: session.handshake_ack.clone(),
             }]);
         }
-        if self.sessions.len() >= self.config.max_sessions {
-            return Err(EngineError::SessionCapacity);
-        }
         let pending = self
             .pending
             .get(&frame.session_id)
+            .cloned()
             .ok_or(crate::HandshakeError::UnknownPendingHandshake)?;
         if pending.peer_id != peer_id {
             return Err(EngineError::UnexpectedPeer);
+        }
+        let replaces_active_session = pending
+            .resume_from
+            .is_some_and(|session_id| self.sessions.contains_key(&session_id));
+        if self.sessions.len() >= self.config.max_sessions && !replaces_active_session {
+            return Err(EngineError::SessionCapacity);
         }
         let finish = ClientFinish::decode(&frame)?;
         finish.verify(
@@ -819,6 +926,26 @@ impl ServerEngine {
         );
         let handshake_ack = sealer.seal(FrameType::HandshakeAck, None, &[])?;
         let client_finish = frame.encode()?;
+        let resume_from = pending.resume_from;
+        let conversations = resume_from.map_or_else(HashMap::new, |old_session_id| {
+            self.sessions
+                .remove(&old_session_id)
+                .map(|session| session.conversations)
+                .or_else(|| {
+                    self.resumable
+                        .remove(&old_session_id)
+                        .map(|state| state.conversations)
+                })
+                .unwrap_or_default()
+        });
+        let resumption_credential = if conversations.is_empty() {
+            None
+        } else {
+            pending
+                .client_hello
+                .resumption
+                .map(|credential| (credential, now + self.config.resumption_lifetime))
+        };
         self.sessions.insert(
             frame.session_id,
             ServerSession {
@@ -833,13 +960,14 @@ impl ServerEngine {
                 ),
                 handshake_ack: handshake_ack.clone(),
                 client_finish,
-                conversations: HashMap::new(),
+                conversations,
+                resumption_credential,
                 last_activity: now,
                 expires_at: now + self.config.session_idle_timeout,
             },
         );
         self.pending.remove(&frame.session_id);
-        Ok(vec![
+        let mut actions = vec![
             TunnelAction::SendTunnelFrame {
                 peer_id,
                 bytes: handshake_ack,
@@ -848,9 +976,20 @@ impl ServerEngine {
                 peer_id,
                 session_id: frame.session_id,
                 cipher_suite: self.config.cipher_suite,
+                resumed: resume_from.is_some(),
             },
-            TunnelAction::ScheduleTimer(self.config.session_idle_timeout),
-        ])
+        ];
+        if let Some(old_session_id) = resume_from {
+            actions.push(TunnelAction::SessionResumed {
+                peer_id,
+                old_session_id,
+                new_session_id: frame.session_id,
+            });
+        }
+        actions.push(TunnelAction::ScheduleTimer(
+            self.config.session_idle_timeout,
+        ));
+        Ok(actions)
     }
 
     fn handle_record(
@@ -860,6 +999,7 @@ impl ServerEngine {
         bytes: Vec<u8>,
         now: Instant,
     ) -> Result<Vec<TunnelAction>, EngineError> {
+        let now_ms = self.now_ms(now);
         let session = self
             .sessions
             .get_mut(&session_id)
@@ -896,6 +1036,47 @@ impl ServerEngine {
             });
         } else {
             session.conversations.insert(conversation_id, now);
+        }
+        let should_refresh_credential =
+            session
+                .resumption_credential
+                .as_ref()
+                .is_none_or(|(_, expires_at)| {
+                    expires_at.saturating_duration_since(now) <= self.config.resumption_lifetime / 2
+                });
+        if should_refresh_credential {
+            let lifetime_ms =
+                u64::try_from(self.config.resumption_lifetime.as_millis()).unwrap_or(u64::MAX);
+            let credential = issue_resumption_credential(
+                self.cookie_secret.as_ref(),
+                session_id,
+                conversation_id,
+                now_ms,
+                now_ms.saturating_add(lifetime_ms),
+            )?;
+            session.resumption_credential =
+                Some((credential, now + self.config.resumption_lifetime));
+            let conversations: Vec<_> = session.conversations.keys().copied().collect();
+            for conversation_id in conversations {
+                let bytes = session.sealer.seal(
+                    FrameType::ResumptionCredential,
+                    Some(conversation_id),
+                    credential.as_bytes(),
+                )?;
+                actions.push(TunnelAction::SendTunnelFrame { peer_id, bytes });
+            }
+        } else if is_new {
+            let credential = session
+                .resumption_credential
+                .as_ref()
+                .map(|(credential, _)| *credential)
+                .expect("active session has a resumption credential");
+            let bytes = session.sealer.seal(
+                FrameType::ResumptionCredential,
+                Some(conversation_id),
+                credential.as_bytes(),
+            )?;
+            actions.push(TunnelAction::SendTunnelFrame { peer_id, bytes });
         }
         actions.push(TunnelAction::DeliverToUpstream {
             session_id,
@@ -987,19 +1168,34 @@ impl ServerEngine {
             .sessions
             .iter()
             .filter_map(|(session_id, session)| {
-                (session.conversations.is_empty()
-                    && now >= session.expires_at
+                (now >= session.expires_at
                     && now.saturating_duration_since(session.last_activity) >= session_timeout)
                     .then_some((*session_id, session.peer_id))
             })
             .collect();
         for (session_id, peer_id) in expired_sessions {
-            self.sessions.remove(&session_id);
+            if let Some(session) = self.sessions.remove(&session_id) {
+                if !session.conversations.is_empty() {
+                    self.resumable.insert(
+                        session_id,
+                        ResumableSession {
+                            conversations: session.conversations,
+                            expires_at: now + self.config.resumption_lifetime,
+                        },
+                    );
+                }
+            }
             actions.push(TunnelAction::SessionClosed {
                 peer_id,
                 session_id,
             });
         }
+        self.resumable.retain(|_, state| now < state.expires_at);
         actions
+    }
+
+    fn now_ms(&mut self, now: Instant) -> u64 {
+        let origin = self.clock_origin.get_or_insert(now);
+        u64::try_from(now.saturating_duration_since(*origin).as_millis()).unwrap_or(u64::MAX)
     }
 }

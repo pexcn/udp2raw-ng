@@ -94,6 +94,7 @@ pub struct EngineConfig {
     pub handshake_max_attempts: usize,
     pub require_handshake_cookie: bool,
     pub handshake_cookie_lifetime: Duration,
+    pub resumption_lifetime: Duration,
     pub max_pending_handshakes: usize,
     pub max_pending_handshakes_per_peer: usize,
     pub max_sessions: usize,
@@ -157,6 +158,9 @@ impl EngineConfig {
         if self.handshake_cookie_lifetime.is_zero() {
             return Err(ConfigError::ZeroHandshakeCookieLifetime);
         }
+        if self.resumption_lifetime.is_zero() {
+            return Err(ConfigError::ZeroResumptionLifetime);
+        }
         if self.max_pending_handshakes == 0 {
             return Err(ConfigError::ZeroPendingHandshakeLimit);
         }
@@ -187,6 +191,7 @@ impl Default for EngineConfig {
             handshake_max_attempts: 8,
             require_handshake_cookie: true,
             handshake_cookie_lifetime: Duration::from_secs(30),
+            resumption_lifetime: Duration::from_secs(30),
             max_pending_handshakes: 1024,
             max_pending_handshakes_per_peer: 64,
             max_sessions: 4096,

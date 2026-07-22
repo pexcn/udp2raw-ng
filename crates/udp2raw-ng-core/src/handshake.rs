@@ -4,16 +4,31 @@ use crate::crypto::{
 use std::time::Duration;
 
 use crate::{
-    CipherSuite, CryptoError, FrameType, HandshakeError, PeerId, Psk, SessionId, WireFrame,
+    CipherSuite, ConversationId, CryptoError, FrameType, HandshakeError, PeerId, Psk, SessionId,
+    WireFrame,
 };
 
-const CLIENT_HELLO_BASE_LENGTH: usize = 50;
+const RESUMPTION_CREDENTIAL_LENGTH: usize = 104;
+const CLIENT_HELLO_BASE_LENGTH: usize = 51;
 const CLIENT_HELLO_COOKIE_LENGTH: usize = CLIENT_HELLO_BASE_LENGTH + 40;
-const HELLO_RETRY_UNSIGNED_LENGTH: usize = 89;
+const CLIENT_HELLO_RESUMPTION_LENGTH: usize =
+    CLIENT_HELLO_BASE_LENGTH + RESUMPTION_CREDENTIAL_LENGTH;
+const CLIENT_HELLO_COOKIE_RESUMPTION_LENGTH: usize =
+    CLIENT_HELLO_COOKIE_LENGTH + RESUMPTION_CREDENTIAL_LENGTH;
+const HELLO_RETRY_UNSIGNED_LENGTH: usize = 90;
 const HELLO_RETRY_LENGTH: usize = HELLO_RETRY_UNSIGNED_LENGTH + 32;
-const SERVER_HELLO_UNSIGNED_LENGTH: usize = 113;
+const SERVER_HELLO_UNSIGNED_LENGTH: usize = 114;
 const SERVER_HELLO_LENGTH: usize = SERVER_HELLO_UNSIGNED_LENGTH + 32;
 const CLIENT_FINISH_LENGTH: usize = 48;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ResumptionCredential([u8; RESUMPTION_CREDENTIAL_LENGTH]);
+
+impl std::fmt::Debug for ResumptionCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResumptionCredential([redacted])")
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ClientHello {
@@ -21,6 +36,7 @@ pub(crate) struct ClientHello {
     pub(crate) client_nonce: [u8; 32],
     pub(crate) suite: CipherSuite,
     pub(crate) cookie: Option<HandshakeCookie>,
+    pub(crate) resumption: Option<ResumptionCredential>,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +50,7 @@ pub(crate) struct HelloRetry {
     client_nonce: [u8; 32],
     suite: CipherSuite,
     cookie: HandshakeCookie,
+    has_resumption: bool,
     auth_tag: [u8; 32],
 }
 
@@ -44,6 +61,7 @@ pub(crate) struct ServerHello {
     pub(crate) server_nonce: [u8; 32],
     pub(crate) session_salt: [u8; 32],
     pub(crate) suite: CipherSuite,
+    pub(crate) resumed: bool,
     pub(crate) auth_tag: [u8; 32],
 }
 
@@ -54,7 +72,10 @@ pub(crate) struct ClientFinish {
 }
 
 impl ClientHello {
-    pub(crate) fn generate(suite: CipherSuite) -> Result<Self, crate::EngineError> {
+    pub(crate) fn generate(
+        suite: CipherSuite,
+        resumption: Option<ResumptionCredential>,
+    ) -> Result<Self, crate::EngineError> {
         let mut handshake_id = [0_u8; 16];
         let mut client_nonce = [0_u8; 32];
         getrandom::getrandom(&mut handshake_id)
@@ -66,15 +87,18 @@ impl ClientHello {
             client_nonce,
             suite,
             cookie: None,
+            resumption,
         })
     }
 
     pub(crate) fn encode_payload(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(if self.cookie.is_some() {
-            CLIENT_HELLO_COOKIE_LENGTH
-        } else {
-            CLIENT_HELLO_BASE_LENGTH
-        });
+        let mut payload =
+            Vec::with_capacity(match (self.cookie.is_some(), self.resumption.is_some()) {
+                (false, false) => CLIENT_HELLO_BASE_LENGTH,
+                (true, false) => CLIENT_HELLO_COOKIE_LENGTH,
+                (false, true) => CLIENT_HELLO_RESUMPTION_LENGTH,
+                (true, true) => CLIENT_HELLO_COOKIE_RESUMPTION_LENGTH,
+            });
         payload.extend_from_slice(&self.handshake_id);
         payload.extend_from_slice(&self.client_nonce);
         payload.push(self.suite.wire_id());
@@ -82,6 +106,12 @@ impl ClientHello {
             payload.push(1);
             payload.extend_from_slice(&cookie.issued_at_ms.to_be_bytes());
             payload.extend_from_slice(&cookie.tag);
+        } else {
+            payload.push(0);
+        }
+        if let Some(resumption) = self.resumption {
+            payload.push(1);
+            payload.extend_from_slice(resumption.as_bytes());
         } else {
             payload.push(0);
         }
@@ -95,7 +125,10 @@ impl ClientHello {
             || frame.epoch != 0
             || !matches!(
                 frame.payload.len(),
-                CLIENT_HELLO_BASE_LENGTH | CLIENT_HELLO_COOKIE_LENGTH
+                CLIENT_HELLO_BASE_LENGTH
+                    | CLIENT_HELLO_COOKIE_LENGTH
+                    | CLIENT_HELLO_RESUMPTION_LENGTH
+                    | CLIENT_HELLO_COOKIE_RESUMPTION_LENGTH
             )
         {
             return Err(HandshakeError::Malformed);
@@ -103,8 +136,8 @@ impl ClientHello {
         let suite =
             CipherSuite::from_wire_id(frame.payload[48]).map_err(|_| HandshakeError::Malformed)?;
         let cookie = match frame.payload[49] {
-            0 if frame.payload.len() == CLIENT_HELLO_BASE_LENGTH => None,
-            1 if frame.payload.len() == CLIENT_HELLO_COOKIE_LENGTH => Some(HandshakeCookie {
+            0 => None,
+            1 if frame.payload.len() >= CLIENT_HELLO_COOKIE_LENGTH => Some(HandshakeCookie {
                 issued_at_ms: u64::from_be_bytes(
                     frame.payload[50..58].try_into().expect("fixed slice"),
                 ),
@@ -112,11 +145,24 @@ impl ClientHello {
             }),
             _ => return Err(HandshakeError::Malformed),
         };
+        let resumption_offset = if cookie.is_some() { 90 } else { 50 };
+        let resumption = match frame.payload[resumption_offset] {
+            0 if frame.payload.len() == resumption_offset + 1 => None,
+            1 if frame.payload.len() == resumption_offset + 1 + RESUMPTION_CREDENTIAL_LENGTH => {
+                Some(ResumptionCredential(
+                    frame.payload[resumption_offset + 1..]
+                        .try_into()
+                        .expect("fixed slice"),
+                ))
+            }
+            _ => return Err(HandshakeError::Malformed),
+        };
         Ok(Self {
             handshake_id: frame.payload[..16].try_into().expect("fixed slice"),
             client_nonce: frame.payload[16..48].try_into().expect("fixed slice"),
             suite,
             cookie,
+            resumption,
         })
     }
 
@@ -149,6 +195,7 @@ impl HelloRetry {
             client_nonce: client_hello.client_nonce,
             suite: client_hello.suite,
             cookie,
+            has_resumption: client_hello.resumption.is_some(),
             auth_tag: [0; 32],
         };
         retry.auth_tag = handshake_tag(
@@ -171,6 +218,11 @@ impl HelloRetry {
         }
         let suite =
             CipherSuite::from_wire_id(frame.payload[48]).map_err(|_| HandshakeError::Malformed)?;
+        let has_resumption = match frame.payload[89] {
+            0 => false,
+            1 => true,
+            _ => return Err(HandshakeError::Malformed),
+        };
         Ok(Self {
             handshake_id: frame.payload[..16].try_into().expect("fixed slice"),
             client_nonce: frame.payload[16..48].try_into().expect("fixed slice"),
@@ -181,7 +233,8 @@ impl HelloRetry {
                 ),
                 tag: frame.payload[57..89].try_into().expect("fixed slice"),
             },
-            auth_tag: frame.payload[89..121].try_into().expect("fixed slice"),
+            has_resumption,
+            auth_tag: frame.payload[90..122].try_into().expect("fixed slice"),
         })
     }
 
@@ -197,6 +250,9 @@ impl HelloRetry {
         }
         if self.suite != client_hello.suite {
             return Err(HandshakeError::CipherSuiteMismatch);
+        }
+        if self.has_resumption != client_hello.resumption.is_some() {
+            return Err(HandshakeError::AuthenticationFailed);
         }
         verify_handshake_tag(
             psk,
@@ -231,6 +287,7 @@ impl HelloRetry {
         payload.push(self.suite.wire_id());
         payload.extend_from_slice(&self.cookie.issued_at_ms.to_be_bytes());
         payload.extend_from_slice(&self.cookie.tag);
+        payload.push(u8::from(self.has_resumption));
         payload
     }
 }
@@ -256,6 +313,7 @@ impl ServerHello {
         psk: &Psk,
         client_hello: &ClientHello,
         session_id: SessionId,
+        resumed: bool,
     ) -> Result<Self, crate::EngineError> {
         let mut server_nonce = [0_u8; 32];
         let mut session_salt = [0_u8; 32];
@@ -269,6 +327,7 @@ impl ServerHello {
             server_nonce,
             session_salt,
             suite: client_hello.suite,
+            resumed,
             auth_tag: [0; 32],
         };
         let transcript = server_auth_transcript(client_hello, session_id, &hello);
@@ -315,6 +374,7 @@ impl ServerHello {
         payload.extend_from_slice(&self.server_nonce);
         payload.extend_from_slice(&self.session_salt);
         payload.push(self.suite.wire_id());
+        payload.push(u8::from(self.resumed));
         payload
     }
 
@@ -329,13 +389,19 @@ impl ServerHello {
         }
         let suite =
             CipherSuite::from_wire_id(frame.payload[112]).map_err(|_| HandshakeError::Malformed)?;
+        let resumed = match frame.payload[113] {
+            0 => false,
+            1 => true,
+            _ => return Err(HandshakeError::Malformed),
+        };
         Ok(Self {
             handshake_id: frame.payload[..16].try_into().expect("fixed slice"),
             client_nonce: frame.payload[16..48].try_into().expect("fixed slice"),
             server_nonce: frame.payload[48..80].try_into().expect("fixed slice"),
             session_salt: frame.payload[80..112].try_into().expect("fixed slice"),
             suite,
-            auth_tag: frame.payload[113..145].try_into().expect("fixed slice"),
+            resumed,
+            auth_tag: frame.payload[114..146].try_into().expect("fixed slice"),
         })
     }
 
@@ -493,5 +559,69 @@ fn cookie_transcript(client_hello: &ClientHello, peer_id: PeerId, issued_at_ms: 
     transcript.extend_from_slice(&client_hello.handshake_id);
     transcript.extend_from_slice(&client_hello.client_nonce);
     transcript.push(client_hello.suite.wire_id());
+    if let Some(resumption) = client_hello.resumption {
+        transcript.push(1);
+        transcript.extend_from_slice(resumption.as_bytes());
+    } else {
+        transcript.push(0);
+    }
+    transcript
+}
+
+impl ResumptionCredential {
+    pub(crate) const fn from_bytes(bytes: [u8; RESUMPTION_CREDENTIAL_LENGTH]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; RESUMPTION_CREDENTIAL_LENGTH] {
+        &self.0
+    }
+}
+
+pub(crate) fn issue_resumption_credential(
+    secret: &[u8],
+    session_id: SessionId,
+    conversation_id: ConversationId,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+) -> Result<ResumptionCredential, CryptoError> {
+    let mut bytes = [0_u8; RESUMPTION_CREDENTIAL_LENGTH];
+    getrandom::getrandom(&mut bytes[..32]).map_err(|_| CryptoError::KeyDerivationFailed)?;
+    bytes[32..48].copy_from_slice(&session_id.to_be_bytes());
+    bytes[48..56].copy_from_slice(&conversation_id.get().to_be_bytes());
+    bytes[56..64].copy_from_slice(&issued_at_ms.to_be_bytes());
+    bytes[64..72].copy_from_slice(&expires_at_ms.to_be_bytes());
+    let tag = hmac_tag(secret, &resumption_transcript(&bytes[..72]))?;
+    bytes[72..].copy_from_slice(&tag);
+    Ok(ResumptionCredential::from_bytes(bytes))
+}
+
+pub(crate) fn verify_resumption_credential(
+    secret: &[u8],
+    credential: ResumptionCredential,
+    now_ms: u64,
+) -> Result<(SessionId, ConversationId), HandshakeError> {
+    let bytes = credential.as_bytes();
+    let issued_at_ms = u64::from_be_bytes(bytes[56..64].try_into().expect("fixed slice"));
+    let expires_at_ms = u64::from_be_bytes(bytes[64..72].try_into().expect("fixed slice"));
+    if issued_at_ms > now_ms || expires_at_ms < issued_at_ms || now_ms > expires_at_ms {
+        return Err(HandshakeError::InvalidResumptionCredential);
+    }
+    verify_hmac(secret, &resumption_transcript(&bytes[..72]), &bytes[72..])
+        .map_err(|_| HandshakeError::InvalidResumptionCredential)?;
+    let session_id = SessionId::from_u128(u128::from_be_bytes(
+        bytes[32..48].try_into().expect("fixed slice"),
+    ));
+    let raw_conversation = u64::from_be_bytes(bytes[48..56].try_into().expect("fixed slice"));
+    let conversation_id = std::num::NonZeroU64::new(raw_conversation)
+        .map(ConversationId::new)
+        .ok_or(HandshakeError::InvalidResumptionCredential)?;
+    Ok((session_id, conversation_id))
+}
+
+fn resumption_transcript(unsigned: &[u8]) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(32 + unsigned.len());
+    transcript.extend_from_slice(b"udp2raw-ng/v3/resumption-credential");
+    transcript.extend_from_slice(unsigned);
     transcript
 }

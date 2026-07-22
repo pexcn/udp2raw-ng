@@ -2,7 +2,7 @@
 
 ## 本轮目标
 
-本轮将平台无关核心推进到基础 session 生命周期：在可靠、非乐观的 v3 认证握手之上增加认证 heartbeat、client session 超时、自动/手动重连状态和 server 空闲 session 回收。恢复凭据和 stable identity 尚未实现，因此重连会建立新的安全 session，但 client 会保留本地 conversation 映射。真实 Linux FakeTCP 数据面仍不在本轮范围内。
+本轮将平台无关核心推进到安全 session 恢复：在可靠、非乐观的 v3 认证握手与基础重连生命周期之上，增加短期、服务端认证的恢复凭据，以及新安全 session 建立后的 conversation/upstream 状态迁移。恢复仍是进程内、短期且单服务器的，不是跨进程 stable identity。真实 Linux FakeTCP 数据面仍不在本轮范围内。
 
 ## 已实现
 
@@ -15,8 +15,12 @@
 - client 在 `Ready` 下按配置间隔发送受保护 heartbeat，server 认证后回送受保护 heartbeat；
 - client 仅以成功认证的 server record 刷新接收活性，超时后关闭旧 session 并自动进入 `Reconnecting`；
 - 支持显式 `Reconnect` 事件，重连期间拒绝业务数据，握手成功后回到 `Ready`；
-- 重连建立新的随机 session 和方向密钥，同时保留 client 本地 peer 到 conversation ID 的映射；
-- server 跟踪认证入站 record 和 upstream 回包活动，并仅在无活跃 conversation 时回收空闲 session；
+- 重连始终建立新的随机 session、方向密钥、packet number 与 replay window，绝不复用旧 record 状态；
+- server 通过受 HMAC-SHA256 保护、带签发/过期时间、旧 session ID、conversation 锚点和随机值的短期凭据识别可恢复逻辑 session；
+- 恢复凭据只通过已认证 record 下发，并绑定到后续 `ClientHello`、Cookie 和完整握手 transcript；
+- server 在新 `ClientFinish` 成功认证后才原子迁移旧 conversation 集合，并发出 `SessionResumed { old_session_id, new_session_id }` 供宿主迁移 connected upstream socket 的 session 路由键；
+- client 只有在认证 `HandshakeAck` 确认 `resumed=true` 后保留 conversation 映射；凭据无效/过期或 server 状态缺失时安全回退到新 session 并关闭旧本地映射；
+- server 跟踪认证入站 record 和 upstream 回包活动，空闲 session 关闭后可在配置的短期恢复窗口内保留 conversation/upstream 元数据；
 - session 建立、heartbeat/data 活动和重连均返回宿主可执行的单调时钟定时 action；
 - conversation 容量、空闲回收、反向映射和 `(session, conversation)` 隔离；
 - PSK 长度限制、调试输出脱敏和 drop 时清零；
@@ -38,7 +42,8 @@
 - client-to-server / server-to-client 方向隔离，以及 record key / nonce prefix 用途隔离；
 - cipher suite 不一致时明确拒绝，不做隐式降级；
 - 全局及按 `PeerId` 有界 pending handshake、握手超时回收和已认证 session 容量限制；
-- server 只有在验证有效 `ClientFinish` 后才创建已认证 session。
+- server 只有在验证有效 `ClientFinish` 后才创建已认证 session 或迁移恢复状态；
+- server hello 的 `resumed` 结果受 transcript 认证，攻击者不能把普通握手篡改成恢复握手或反向降级而不被检测。
 
 ### Record layer
 
@@ -47,6 +52,7 @@
 - AES-128-GCM；
 - AES-256-GCM；
 - `none` 认证明文模式：payload 不加密，但使用完整 HMAC-SHA256 tag；
+- 受保护 `ResumptionCredential` record 类型，和 data/heartbeat 共享方向密钥、防重放及认证边界；
 - 每方向独立 packet number 和 nonce prefix；
 - header、协议版本、session、epoch、packet number、frame type、conversation、方向、cipher suite 和长度均绑定到认证上下文；
 - 非零 epoch、错误 session、错误方向、截断 tag、非法 record 类型和畸形长度均拒绝；
@@ -65,8 +71,9 @@
 - 非 `Ready` 状态业务数据拒绝；
 - 认证 heartbeat 往返和持续保活测试；
 - client 超时自动重连、显式重连、重连握手超时关闭测试；
-- 重连后沿用 conversation ID 并在新 session 下继续投递测试；
-- server 在 conversation 存活期间不回收 session、conversation 过期后回收 session 测试；
+- 有效恢复凭据下跨 session 沿用 conversation、双向继续投递、旧 session 失效和 `SessionResumed` action 测试；
+- 恢复凭据过期时不迁移 server 状态、client 清理旧映射并创建新 conversation 的安全回退测试；
+- server 空闲 session 转为短期可恢复状态且不立即关闭 upstream conversation 的测试；
 - 基础帧所有截断位置和 trailing bytes 拒绝测试；
 - 帧解码 fuzz target；
 - `cargo fmt --check`、严格 Clippy 和 workspace 测试作为验收项。
@@ -75,7 +82,8 @@
 
 - 面向公网握手洪泛的完整防护和时间窗 token-bucket 来源速率限制；
 - Cookie 密钥轮换、跨进程平滑轮换和可观测拒绝指标；
-- session 恢复凭据、stable client identity、server 端跨 session conversation/upstream 迁移，以及密钥轮换/非零 epoch；
+- 跨进程/多节点 stable client identity、持久化或可轮换恢复凭据密钥、恢复状态复制，以及密钥轮换/非零 epoch；
+- 宿主对 `SessionResumed` action 的真实 connected UDP upstream socket 路由迁移（核心已提供原子迁移信号，真实 upstream runtime 尚未实现）；
 - 非 `Ready` 本地 UDP 严格有界暂存队列、重连退避/抖动和宿主网络路径切换；
 - AES 硬件加速实际启用/软件回退的可观测指标；
 - PMTU 探测、可信 ICMP 关联和 MTU 事件；
@@ -89,15 +97,15 @@
 
 平台无关的 v3 内层协议已经提供 PSK 身份证明、完整性、防重放，以及除 `none` 外的机密性；`none` 只暴露 payload 内容，不会关闭握手认证、record 认证或防重放。未经认证的网络帧不能创建已认证 session、创建 conversation 或投递应用明文。
 
-client 不再在发出 `ClientFinish` 后乐观进入 `Ready`；只有受保护 server ack 通过 record 认证和防重放后才建立会话。`Ready` 状态下的 heartbeat 与数据共享同一 record 认证、防重放和方向密钥边界；未认证输入不能刷新 session 活性。client 超时会放弃旧 record 状态并发起全新握手，server 只依据已认证活动延长空闲期限，且不会在仍有活跃 conversation 时回收 session。
+client 不再在发出 `ClientFinish` 后乐观进入 `Ready`；只有受保护 server ack 通过 record 认证和防重放后才建立会话。`Ready` 状态下的 heartbeat、数据和恢复凭据共享同一 record 认证、防重放和方向密钥边界；未认证输入不能刷新 session 活性。client 超时会放弃旧 record 状态并发起全新握手；即使恢复成功，新 session 也使用全新密钥、nonce prefix、packet number 和 replay window。
 
-当前“重连”不是协议级恢复：没有 stable identity 或恢复凭据，server 不会把旧 session 的 conversation/upstream socket 自动迁移到新 session。client 保留 conversation ID 只能保证本地映射连续，并为未来恢复协议固定状态机接口。当前实现仍不能宣称适合直接部署到不可信公网：尚无 token-bucket 来源速率限制、分布式攻击缓解、Cookie 密钥轮换和对应指标。`PeerId` 由宿主分配，是 Cookie 的路径绑定输入和路由元数据，不是稳定安全身份；宿主必须保证同一路径在握手期间映射稳定且攻击者不能任意冒用。
+当前恢复凭据由服务端进程随机秘密签发，默认短期有效并仅引用服务端仍保留的内存状态；服务重启、状态过期、凭据篡改或状态缺失都会安全回退为非恢复握手。恢复成功只在新握手完成后发生，旧 session 随即失效；旧路径迟到 record 不会被新 session 接受。核心迁移 conversation 元数据并返回宿主 action，但真实 connected upstream socket 的路由迁移要由后续 runtime 执行。当前实现仍不能宣称适合直接部署到不可信公网：尚无 token-bucket 来源速率限制、分布式攻击缓解、Cookie/恢复密钥轮换和对应指标。`PeerId` 由宿主分配，是 Cookie 的路径绑定输入和路由元数据，不是稳定安全身份；宿主必须保证同一路径在握手期间映射稳定且攻击者不能任意冒用。
 
 真实 Linux tunnel 仍不可用。CLI 的正常运行路径继续安全拒绝启动，`LinuxFakeTcpTransport` 的所有操作继续返回 `NotImplemented`，不会将安全核心静默降级为裸网络传输。
 
 ## 下一阶段建议
 
-1. 实现 stable client identity / 恢复凭据、server 端 conversation/upstream 迁移、有界重连数据队列，并为 epoch/key rotation 固化状态机；
+1. 实现宿主 `SessionResumed` upstream socket 路由迁移、有界重连数据队列，并为 epoch/key rotation 固化状态机；
 2. 增加来源 token-bucket、Cookie 密钥轮换和握手拒绝/重试指标；
 3. 实现 Tokio worker shard、有界队列和纯 UDP upstream harness；
 4. 开始 Linux FakeTCP 报文编解码、校验和、AF_PACKET/raw socket 与 cBPF；

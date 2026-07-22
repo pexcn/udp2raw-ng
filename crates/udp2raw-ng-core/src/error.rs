@@ -26,6 +26,8 @@ pub enum ConfigError {
     ZeroHandshakeAttemptLimit,
     #[error("handshake cookie lifetime must be greater than zero")]
     ZeroHandshakeCookieLifetime,
+    #[error("session resumption lifetime must be greater than zero")]
+    ZeroResumptionLifetime,
     #[error("pending handshake limit must be greater than zero")]
     ZeroPendingHandshakeLimit,
     #[error("per-peer pending handshake limit must be greater than zero")]
@@ -92,6 +94,8 @@ pub enum HandshakeError {
     AuthenticationFailed,
     #[error("handshake cookie is invalid or expired")]
     InvalidCookie,
+    #[error("session resumption credential is invalid or expired")]
+    InvalidResumptionCredential,
     #[error("no matching pending handshake")]
     UnknownPendingHandshake,
 }
