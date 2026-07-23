@@ -6,6 +6,9 @@
 
 完整需求见 [udp2raw-ng-spec.md](docs/udp2raw-ng-spec.md)，当前实现边界见 [docs/implementation-status.md](docs/implementation-status.md)。
 
+下一阶段将切换为无心跳、按业务触发的重连模型；具体取舍、协议/API 变更与验收标准见
+[docs/next-stage-plan.md](docs/next-stage-plan.md)。在该计划实施前，当前 v3 仍会发送受保护 heartbeat。
+
 ## Workspace
 
 - `udp2raw-ng-core`：不依赖 Tokio/Linux I/O 的同步安全协议核心。
