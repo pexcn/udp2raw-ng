@@ -92,6 +92,10 @@ pub struct EngineConfig {
     pub handshake_retry_interval: Duration,
     pub handshake_timeout: Duration,
     pub handshake_max_attempts: usize,
+    pub reconnect_queue_capacity: usize,
+    pub reconnect_queue_timeout: Duration,
+    pub handshake_rate_limit_burst: usize,
+    pub handshake_rate_refill_interval: Duration,
     pub require_handshake_cookie: bool,
     pub handshake_cookie_lifetime: Duration,
     pub resumption_lifetime: Duration,
@@ -155,6 +159,18 @@ impl EngineConfig {
         if self.handshake_max_attempts == 0 {
             return Err(ConfigError::ZeroHandshakeAttemptLimit);
         }
+        if self.reconnect_queue_capacity == 0 {
+            return Err(ConfigError::ZeroReconnectQueueCapacity);
+        }
+        if self.reconnect_queue_timeout.is_zero() {
+            return Err(ConfigError::ZeroReconnectQueueTimeout);
+        }
+        if self.handshake_rate_limit_burst == 0 {
+            return Err(ConfigError::ZeroHandshakeRateLimitBurst);
+        }
+        if self.handshake_rate_refill_interval.is_zero() {
+            return Err(ConfigError::ZeroHandshakeRateRefillInterval);
+        }
         if self.handshake_cookie_lifetime.is_zero() {
             return Err(ConfigError::ZeroHandshakeCookieLifetime);
         }
@@ -189,6 +205,10 @@ impl Default for EngineConfig {
             handshake_retry_interval: Duration::from_millis(500),
             handshake_timeout: Duration::from_secs(10),
             handshake_max_attempts: 8,
+            reconnect_queue_capacity: 256,
+            reconnect_queue_timeout: Duration::from_secs(5),
+            handshake_rate_limit_burst: 32,
+            handshake_rate_refill_interval: Duration::from_millis(100),
             require_handshake_cookie: true,
             handshake_cookie_lifetime: Duration::from_secs(30),
             resumption_lifetime: Duration::from_secs(30),

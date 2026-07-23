@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use udp2raw_ng_core::{
-    CipherSuite, ClientEngine, EngineConfig, EngineError, PeerId, Psk, RecordError, ServerEngine,
-    SessionId, SessionState, TunnelAction, TunnelEvent,
+    CipherSuite, ClientDatagramDropReason, ClientEngine, EngineConfig, EngineError, PeerId, Psk,
+    RecordError, ServerEngine, SessionId, SessionState, TunnelAction, TunnelEvent,
 };
 
 fn psk(byte: u8) -> Psk {
@@ -703,6 +703,49 @@ fn per_peer_pending_handshake_limit_is_enforced_after_cookie_validation() {
 }
 
 #[test]
+fn unauthenticated_handshakes_are_rate_limited_per_peer_and_refill() {
+    let now = Instant::now();
+    let client_peer = PeerId::new(94);
+    let server_peer = PeerId::new(95);
+    let (client_config, mut server_config) = configs(CipherSuite::ChaCha20Poly1305);
+    server_config.handshake_rate_limit_burst = 1;
+    server_config.handshake_rate_refill_interval = Duration::from_millis(10);
+    let mut client = ClientEngine::new(client_config, psk(17), server_peer).expect("client");
+    let mut server = ServerEngine::new(server_config, psk(17)).expect("server");
+    let start = client.handle(TunnelEvent::Start, now).expect("start");
+    let (_, hello) = tunnel_frame(&start);
+
+    server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: hello.clone(),
+            },
+            now,
+        )
+        .expect("first hello is allowed");
+    assert!(matches!(
+        server.handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: hello.clone(),
+            },
+            now,
+        ),
+        Err(EngineError::HandshakeRateLimited)
+    ));
+    server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: hello,
+            },
+            now + Duration::from_millis(10),
+        )
+        .expect("one token refills");
+}
+
+#[test]
 fn application_data_is_rejected_before_ready() {
     let (config, _) = configs(CipherSuite::ChaCha20Poly1305);
     let mut client = ClientEngine::new(config, psk(9), PeerId::new(2)).expect("client");
@@ -717,6 +760,193 @@ fn application_data_is_rejected_before_ready() {
         ),
         Err(EngineError::SessionNotReady)
     ));
+}
+
+#[test]
+fn handshaking_client_uses_a_bounded_datagram_queue() {
+    let now = Instant::now();
+    let mut config = EngineConfig::client();
+    config.reconnect_queue_capacity = 1;
+    let mut client = ClientEngine::new(config, psk(15), PeerId::new(92)).expect("client");
+    let first_peer: SocketAddr = "127.0.0.1:32001".parse().expect("address");
+    let second_peer: SocketAddr = "127.0.0.1:32002".parse().expect("address");
+    client.handle(TunnelEvent::Start, now).expect("start");
+
+    let queued = client
+        .handle(
+            TunnelEvent::ClientDatagram {
+                local_peer: first_peer,
+                payload: b"first".to_vec(),
+            },
+            now,
+        )
+        .expect("queue first datagram");
+    assert!(
+        queued
+            .iter()
+            .any(|action| matches!(action, TunnelAction::ScheduleTimer(_)))
+    );
+
+    let dropped = client
+        .handle(
+            TunnelEvent::ClientDatagram {
+                local_peer: second_peer,
+                payload: b"second".to_vec(),
+            },
+            now,
+        )
+        .expect("drop full queue");
+    assert_eq!(
+        dropped,
+        vec![TunnelAction::ClientDatagramDropped {
+            local_peer: second_peer,
+            reason: ClientDatagramDropReason::ReconnectQueueFull,
+        }]
+    );
+}
+
+#[test]
+fn queued_datagram_expires_before_session_establishment() {
+    let now = Instant::now();
+    let mut config = EngineConfig::client();
+    config.reconnect_queue_timeout = Duration::from_millis(10);
+    let mut client = ClientEngine::new(config, psk(16), PeerId::new(93)).expect("client");
+    let local_peer: SocketAddr = "127.0.0.1:32003".parse().expect("address");
+    client.handle(TunnelEvent::Start, now).expect("start");
+    client
+        .handle(
+            TunnelEvent::ClientDatagram {
+                local_peer,
+                payload: b"queued".to_vec(),
+            },
+            now,
+        )
+        .expect("queue datagram");
+
+    let actions = client
+        .handle(
+            TunnelEvent::TimeAdvanced(now + Duration::from_millis(10)),
+            now + Duration::from_millis(10),
+        )
+        .expect("expire queued datagram");
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        TunnelAction::ClientDatagramDropped {
+            local_peer: peer,
+            reason: ClientDatagramDropReason::ReconnectQueueExpired,
+        } if *peer == local_peer
+    )));
+}
+
+#[test]
+fn reconnect_flushes_queued_datagrams_in_fifo_order_after_authenticated_ack() {
+    let now = Instant::now();
+    let (mut client, mut server, client_peer, server_peer, _) =
+        establish(CipherSuite::ChaCha20Poly1305);
+    let first_peer: SocketAddr = "127.0.0.1:32004".parse().expect("address");
+    let second_peer: SocketAddr = "127.0.0.1:32005".parse().expect("address");
+
+    let reconnect_actions = client
+        .handle(TunnelEvent::Reconnect, now)
+        .expect("start reconnect");
+    let (_, hello) = tunnel_frame(&reconnect_actions);
+    for (local_peer, payload) in [
+        (first_peer, b"first queued".to_vec()),
+        (second_peer, b"second queued".to_vec()),
+    ] {
+        client
+            .handle(
+                TunnelEvent::ClientDatagram {
+                    local_peer,
+                    payload,
+                },
+                now,
+            )
+            .expect("queue reconnect datagram");
+    }
+
+    let retry_actions = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: hello,
+            },
+            now,
+        )
+        .expect("challenge");
+    let (_, retry) = tunnel_frame(&retry_actions);
+    let retry_hello_actions = client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: retry,
+            },
+            now,
+        )
+        .expect("cookie hello");
+    let (_, retry_hello) = tunnel_frame(&retry_hello_actions);
+    let server_hello_actions = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: retry_hello,
+            },
+            now,
+        )
+        .expect("server hello");
+    let (_, server_hello) = tunnel_frame(&server_hello_actions);
+    let finish_actions = client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: server_hello,
+            },
+            now,
+        )
+        .expect("finish");
+    let (_, finish) = tunnel_frame(&finish_actions);
+    let established = server
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: client_peer,
+                bytes: finish,
+            },
+            now,
+        )
+        .expect("establish server");
+    let (_, ack) = tunnel_frame(&established);
+    let flushed = client
+        .handle(
+            TunnelEvent::TunnelFrame {
+                peer_id: server_peer,
+                bytes: ack,
+            },
+            now,
+        )
+        .expect("authenticated acknowledgement");
+
+    let queued_frames = tunnel_frames(&flushed);
+    assert_eq!(queued_frames.len(), 2);
+    let mut delivered_payloads = Vec::new();
+    for (_, bytes) in queued_frames {
+        let actions = server
+            .handle(
+                TunnelEvent::TunnelFrame {
+                    peer_id: client_peer,
+                    bytes,
+                },
+                now,
+            )
+            .expect("deliver queued datagram");
+        delivered_payloads.extend(actions.into_iter().filter_map(|action| match action {
+            TunnelAction::DeliverToUpstream { payload, .. } => Some(payload),
+            _ => None,
+        }));
+    }
+    assert_eq!(
+        delivered_payloads,
+        [b"first queued".to_vec(), b"second queued".to_vec()]
+    );
 }
 
 #[test]

@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{Direction, SessionKeys};
 use crate::handshake::{
@@ -23,6 +23,18 @@ pub enum SessionState {
     Ready,
     Reconnecting,
     Closed,
+}
+
+/// Why a locally received UDP datagram was intentionally discarded before it
+/// could be placed in a protected tunnel record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientDatagramDropReason {
+    /// The bounded handshaking/reconnection queue was already full.
+    ReconnectQueueFull,
+    /// The datagram waited too long for an authenticated session.
+    ReconnectQueueExpired,
+    /// The handshake ended without establishing a session.
+    SessionClosed,
 }
 
 /// Inputs accepted by the synchronous engine.
@@ -89,6 +101,10 @@ pub enum TunnelAction {
         session_id: Option<SessionId>,
         conversation_id: ConversationId,
     },
+    ClientDatagramDropped {
+        local_peer: SocketAddr,
+        reason: ClientDatagramDropReason,
+    },
     ScheduleTimer(Duration),
 }
 
@@ -97,6 +113,12 @@ struct ClientConversation {
     id: ConversationId,
     last_activity: Instant,
     resumption: Option<(SessionId, ResumptionCredential)>,
+}
+
+struct QueuedClientDatagram {
+    local_peer: SocketAddr,
+    payload: Zeroizing<Vec<u8>>,
+    queued_at: Instant,
 }
 
 enum ClientHandshakePhase {
@@ -133,6 +155,7 @@ pub struct ClientEngine {
     session: Option<ClientSession>,
     by_peer: HashMap<SocketAddr, ClientConversation>,
     by_id: HashMap<ConversationId, SocketAddr>,
+    queued_datagrams: VecDeque<QueuedClientDatagram>,
 }
 
 impl ClientEngine {
@@ -150,6 +173,7 @@ impl ClientEngine {
             session: None,
             by_peer: HashMap::new(),
             by_id: HashMap::new(),
+            queued_datagrams: VecDeque::new(),
         })
     }
 
@@ -246,14 +270,30 @@ impl ClientEngine {
     fn handle_local(
         &mut self,
         local_peer: SocketAddr,
-        payload: Vec<u8>,
+        mut payload: Vec<u8>,
         now: Instant,
     ) -> Result<Vec<TunnelAction>, EngineError> {
-        if self.state != SessionState::Ready {
-            return Err(EngineError::SessionNotReady);
-        }
         if payload.len() > self.config.max_frame_payload {
             return Err(EngineError::PayloadTooLarge);
+        }
+        if self.state != SessionState::Ready {
+            if self.is_handshaking() {
+                if self.queued_datagrams.len() >= self.config.reconnect_queue_capacity {
+                    return Ok(vec![TunnelAction::ClientDatagramDropped {
+                        local_peer,
+                        reason: ClientDatagramDropReason::ReconnectQueueFull,
+                    }]);
+                }
+                self.queued_datagrams.push_back(QueuedClientDatagram {
+                    local_peer,
+                    payload: Zeroizing::new(payload),
+                    queued_at: now,
+                });
+                return Ok(vec![TunnelAction::ScheduleTimer(
+                    self.config.reconnect_queue_timeout,
+                )]);
+            }
+            return Err(EngineError::SessionNotReady);
         }
         let mut actions = Vec::with_capacity(2);
         let conversation_id = if let Some(conversation) = self.by_peer.get_mut(&local_peer) {
@@ -282,7 +322,9 @@ impl ClientEngine {
         let session = self.session.as_mut().ok_or(EngineError::SessionNotReady)?;
         let bytes = session
             .sealer
-            .seal(FrameType::Data, Some(conversation_id), &payload)?;
+            .seal(FrameType::Data, Some(conversation_id), &payload);
+        payload.zeroize();
+        let bytes = bytes?;
         actions.push(TunnelAction::SendTunnelFrame {
             peer_id: self.server_peer,
             bytes,
@@ -355,6 +397,7 @@ impl ClientEngine {
                 cipher_suite: self.config.cipher_suite,
                 resumed,
             });
+            actions.extend(self.flush_queued_datagrams(now));
             actions.push(TunnelAction::ScheduleTimer(self.config.heartbeat_interval));
             return Ok(actions);
         }
@@ -531,6 +574,8 @@ impl ClientEngine {
                 let closed_session = self.session.take().map(|session| session.id);
                 self.handshake = None;
                 self.state = SessionState::Closed;
+                actions
+                    .extend(self.clear_queued_datagrams(ClientDatagramDropReason::SessionClosed));
                 if let Some(session_id) = closed_session {
                     actions.push(TunnelAction::SessionClosed {
                         peer_id: self.server_peer,
@@ -593,6 +638,7 @@ impl ClientEngine {
                 }
             }
         }
+        actions.extend(self.expire_queued_datagrams(now));
         let timeout = self.config.conversation_idle_timeout;
         let expired: Vec<_> = self
             .by_peer
@@ -629,6 +675,62 @@ impl ClientEngine {
         actions
     }
 
+    fn flush_queued_datagrams(&mut self, now: Instant) -> Vec<TunnelAction> {
+        let mut actions = Vec::new();
+        while let Some(mut queued) = self.queued_datagrams.pop_front() {
+            if now.saturating_duration_since(queued.queued_at)
+                >= self.config.reconnect_queue_timeout
+            {
+                actions.push(TunnelAction::ClientDatagramDropped {
+                    local_peer: queued.local_peer,
+                    reason: ClientDatagramDropReason::ReconnectQueueExpired,
+                });
+                continue;
+            }
+            let payload = std::mem::take(&mut *queued.payload);
+            match self.handle_local(queued.local_peer, payload, now) {
+                Ok(mut queued_actions) => actions.append(&mut queued_actions),
+                Err(_) => actions.push(TunnelAction::ClientDatagramDropped {
+                    local_peer: queued.local_peer,
+                    reason: ClientDatagramDropReason::SessionClosed,
+                }),
+            }
+        }
+        actions
+    }
+
+    fn expire_queued_datagrams(&mut self, now: Instant) -> Vec<TunnelAction> {
+        let mut actions = Vec::new();
+        while self.queued_datagrams.front().is_some_and(|queued| {
+            now.saturating_duration_since(queued.queued_at) >= self.config.reconnect_queue_timeout
+        }) {
+            let queued = self
+                .queued_datagrams
+                .pop_front()
+                .expect("queued datagram is present");
+            actions.push(TunnelAction::ClientDatagramDropped {
+                local_peer: queued.local_peer,
+                reason: ClientDatagramDropReason::ReconnectQueueExpired,
+            });
+        }
+        if !self.queued_datagrams.is_empty() {
+            actions.push(TunnelAction::ScheduleTimer(
+                self.config.reconnect_queue_timeout,
+            ));
+        }
+        actions
+    }
+
+    fn clear_queued_datagrams(&mut self, reason: ClientDatagramDropReason) -> Vec<TunnelAction> {
+        self.queued_datagrams
+            .drain(..)
+            .map(|queued| TunnelAction::ClientDatagramDropped {
+                local_peer: queued.local_peer,
+                reason,
+            })
+            .collect()
+    }
+
     fn is_handshaking(&self) -> bool {
         matches!(
             self.state,
@@ -653,6 +755,11 @@ struct PendingHandshake {
     client_hello: ClientHello,
     server_hello: ServerHello,
     resume_from: Option<SessionId>,
+}
+
+struct HandshakeRateBucket {
+    tokens: usize,
+    last_refill_at: Instant,
 }
 
 struct ServerSession {
@@ -680,6 +787,7 @@ pub struct ServerEngine {
     pending: HashMap<SessionId, PendingHandshake>,
     sessions: HashMap<SessionId, ServerSession>,
     resumable: HashMap<SessionId, ResumableSession>,
+    handshake_rate_buckets: HashMap<PeerId, HandshakeRateBucket>,
 }
 
 impl ServerEngine {
@@ -699,6 +807,7 @@ impl ServerEngine {
             pending: HashMap::new(),
             sessions: HashMap::new(),
             resumable: HashMap::new(),
+            handshake_rate_buckets: HashMap::new(),
         })
     }
 
@@ -768,6 +877,9 @@ impl ServerEngine {
             return Err(EngineError::Handshake(
                 crate::HandshakeError::CipherSuiteMismatch,
             ));
+        }
+        if !self.allow_handshake_attempt(peer_id, now) {
+            return Err(EngineError::HandshakeRateLimited);
         }
         if self.config.require_handshake_cookie {
             let origin = self.clock_origin.get_or_insert(now);
@@ -1191,7 +1303,44 @@ impl ServerEngine {
             });
         }
         self.resumable.retain(|_, state| now < state.expires_at);
+        let bucket_retention = self.config.handshake_rate_refill_interval.saturating_mul(
+            u32::try_from(self.config.handshake_rate_limit_burst).unwrap_or(u32::MAX),
+        );
+        self.handshake_rate_buckets.retain(|_, bucket| {
+            now.saturating_duration_since(bucket.last_refill_at) < bucket_retention
+        });
         actions
+    }
+
+    fn allow_handshake_attempt(&mut self, peer_id: PeerId, now: Instant) -> bool {
+        let burst = self.config.handshake_rate_limit_burst;
+        let refill_interval = self.config.handshake_rate_refill_interval;
+        if !self.handshake_rate_buckets.contains_key(&peer_id)
+            && self.handshake_rate_buckets.len() >= self.config.max_pending_handshakes
+        {
+            return false;
+        }
+        let bucket = self
+            .handshake_rate_buckets
+            .entry(peer_id)
+            .or_insert(HandshakeRateBucket {
+                tokens: burst,
+                last_refill_at: now,
+            });
+        let elapsed = now.saturating_duration_since(bucket.last_refill_at);
+        let refill_count = elapsed.as_nanos() / refill_interval.as_nanos();
+        if refill_count != 0 {
+            bucket.tokens = bucket
+                .tokens
+                .saturating_add(usize::try_from(refill_count).unwrap_or(usize::MAX))
+                .min(burst);
+            bucket.last_refill_at = now;
+        }
+        if bucket.tokens == 0 {
+            return false;
+        }
+        bucket.tokens -= 1;
+        true
     }
 
     fn now_ms(&mut self, now: Instant) -> u64 {

@@ -2,7 +2,7 @@
 
 ## 本轮目标
 
-本轮将平台无关核心推进到安全 session 恢复：在可靠、非乐观的 v3 认证握手与基础重连生命周期之上，增加短期、服务端认证的恢复凭据，以及新安全 session 建立后的 conversation/upstream 状态迁移。恢复仍是进程内、短期且单服务器的，不是跨进程 stable identity。真实 Linux FakeTCP 数据面仍不在本轮范围内。
+本轮在安全 session 恢复核心之上，完成两项面向服务化的资源保护基础：client 在握手/重连期间的严格有界、短时 UDP 数据报暂存队列，以及 server 在 Cookie 验证之前执行的按 `PeerId` 令牌桶握手限速。恢复仍是进程内、短期且单服务器的，不是跨进程 stable identity；真实 Linux FakeTCP 数据面仍不在本轮范围内。
 
 ## 已实现
 
@@ -15,6 +15,8 @@
 - client 在 `Ready` 下按配置间隔发送受保护 heartbeat，server 认证后回送受保护 heartbeat；
 - client 仅以成功认证的 server record 刷新接收活性，超时后关闭旧 session 并自动进入 `Reconnecting`；
 - 支持显式 `Reconnect` 事件，重连期间拒绝业务数据，握手成功后回到 `Ready`；
+- client 在 `Handshaking` 或 `Reconnecting` 时将合规本地 UDP 数据报放入严格有界 FIFO；队列已满、等待超时或握手失败关闭时，以可观测 action 丢弃，认证 `HandshakeAck` 后按 FIFO 顺序投递未过期数据；
+- 暂存队列按数据报数限制，且每个元素受 `max_frame_payload` 限制；暂存明文以 `Zeroizing` 保存，丢弃或投递后清零；
 - 重连始终建立新的随机 session、方向密钥、packet number 与 replay window，绝不复用旧 record 状态；
 - server 通过受 HMAC-SHA256 保护、带签发/过期时间、旧 session ID、conversation 锚点和随机值的短期凭据识别可恢复逻辑 session；
 - 恢复凭据只通过已认证 record 下发，并绑定到后续 `ClientHello`、Cookie 和完整握手 transcript；
@@ -33,6 +35,7 @@
 - Cookie 绑定 `PeerId`、handshake ID、client nonce、suite 和签发时间，并使用服务端进程随机独立密钥认证；
 - 无 Cookie 或 Cookie 无效/过期时服务端不创建 pending handshake；
 - Cookie 验证使用常量时间 MAC 校验，默认有效期 30 秒；
+- server 对每个 `PeerId` 在 Cookie 验证及 pending handshake 分配之前应用有界令牌桶；默认突发上限为 32，每 100 ms 恢复一个 token，bucket 数量受既有未认证握手全局上限约束；
 - `ClientHello` 和 `ClientFinish` 按配置间隔重试，受总超时和最大尝试次数约束；
 - 重复 cookie hello 返回同一 `ServerHello`，重复有效 finish 返回同一受保护 `HandshakeAck`；
 - client 只有成功打开 `HandshakeAck` 后才进入 `Ready` 并报告 `SessionEstablished`；
@@ -66,11 +69,12 @@
 - FIFO 双向传输、`PeerId` 保留、队列满错误、peer drop/关闭行为和 waker 唤醒；
 - 五种 cipher suite 的完整内存握手与双向数据 round-trip；
 - 握手 challenge、server hello、finish 和 ack 丢失后的重试/幂等测试；
-- Cookie 来源绑定、过期和 per-peer pending 限制测试；
+- Cookie 来源绑定、过期、per-peer pending 限制和按 `PeerId` 令牌桶限速/恢复测试；
 - 错 PSK、suite 不一致、密文/tag 篡改、重复 record、认证失败后合法同 packet number 仍可接受的测试；
 - 非 `Ready` 状态业务数据拒绝；
 - 认证 heartbeat 往返和持续保活测试；
 - client 超时自动重连、显式重连、重连握手超时关闭测试；
+- 重连队列容量、超时丢弃和认证建立后 FIFO 投递测试；
 - 有效恢复凭据下跨 session 沿用 conversation、双向继续投递、旧 session 失效和 `SessionResumed` action 测试；
 - 恢复凭据过期时不迁移 server 状态、client 清理旧映射并创建新 conversation 的安全回退测试；
 - server 空闲 session 转为短期可恢复状态且不立即关闭 upstream conversation 的测试；
@@ -80,11 +84,11 @@
 
 ## 明确未实现
 
-- 面向公网握手洪泛的完整防护和时间窗 token-bucket 来源速率限制；
+- 面向大规模分布式公网握手洪泛的完整防护、来源真实 IP 归一化和限流/拒绝指标聚合；当前按宿主 `PeerId` 的令牌桶只是核心层的基础保护；
 - Cookie 密钥轮换、跨进程平滑轮换和可观测拒绝指标；
 - 跨进程/多节点 stable client identity、持久化或可轮换恢复凭据密钥、恢复状态复制，以及密钥轮换/非零 epoch；
 - 宿主对 `SessionResumed` action 的真实 connected UDP upstream socket 路由迁移（核心已提供原子迁移信号，真实 upstream runtime 尚未实现）；
-- 非 `Ready` 本地 UDP 严格有界暂存队列、重连退避/抖动和宿主网络路径切换；
+- 重连退避/抖动和宿主网络路径切换；
 - AES 硬件加速实际启用/软件回退的可观测指标；
 - PMTU 探测、可信 ICMP 关联和 MTU 事件；
 - worker shard、有界 Tokio 运行时队列和真实 UDP upstream；
@@ -99,15 +103,15 @@
 
 client 不再在发出 `ClientFinish` 后乐观进入 `Ready`；只有受保护 server ack 通过 record 认证和防重放后才建立会话。`Ready` 状态下的 heartbeat、数据和恢复凭据共享同一 record 认证、防重放和方向密钥边界；未认证输入不能刷新 session 活性。client 超时会放弃旧 record 状态并发起全新握手；即使恢复成功，新 session 也使用全新密钥、nonce prefix、packet number 和 replay window。
 
-当前恢复凭据由服务端进程随机秘密签发，默认短期有效并仅引用服务端仍保留的内存状态；服务重启、状态过期、凭据篡改或状态缺失都会安全回退为非恢复握手。恢复成功只在新握手完成后发生，旧 session 随即失效；旧路径迟到 record 不会被新 session 接受。核心迁移 conversation 元数据并返回宿主 action，但真实 connected upstream socket 的路由迁移要由后续 runtime 执行。当前实现仍不能宣称适合直接部署到不可信公网：尚无 token-bucket 来源速率限制、分布式攻击缓解、Cookie/恢复密钥轮换和对应指标。`PeerId` 由宿主分配，是 Cookie 的路径绑定输入和路由元数据，不是稳定安全身份；宿主必须保证同一路径在握手期间映射稳定且攻击者不能任意冒用。
+当前恢复凭据由服务端进程随机秘密签发，默认短期有效并仅引用服务端仍保留的内存状态；服务重启、状态过期、凭据篡改或状态缺失都会安全回退为非恢复握手。恢复成功只在新握手完成后发生，旧 session 随即失效；旧路径迟到 record 不会被新 session 接受。核心迁移 conversation 元数据并返回宿主 action，但真实 connected upstream socket 的路由迁移要由后续 runtime 执行。client 仅在握手或重连状态暂存合规数据报，严格按容量和时限丢弃；不会在 `Closed` 状态继续积压明文。server 的 Cookie 前令牌桶限制单个宿主 `PeerId` 的 handshake 尝试，但该标识由宿主提供，不是来源 IP 身份，尚不足以抵御分布式攻击。当前实现仍不能宣称适合直接部署到不可信公网：尚无来源 IP 归一化、分布式攻击缓解、Cookie/恢复密钥轮换和对应指标。`PeerId` 由宿主分配，是 Cookie 的路径绑定输入和路由元数据，不是稳定安全身份；宿主必须保证同一路径在握手期间映射稳定且攻击者不能任意冒用。
 
 真实 Linux tunnel 仍不可用。CLI 的正常运行路径继续安全拒绝启动，`LinuxFakeTcpTransport` 的所有操作继续返回 `NotImplemented`，不会将安全核心静默降级为裸网络传输。
 
 ## 下一阶段建议
 
-1. 实现宿主 `SessionResumed` upstream socket 路由迁移、有界重连数据队列，并为 epoch/key rotation 固化状态机；
-2. 增加来源 token-bucket、Cookie 密钥轮换和握手拒绝/重试指标；
-3. 实现 Tokio worker shard、有界队列和纯 UDP upstream harness；
+1. 实现托管服务对 `SessionResumed` 的 connected upstream socket 路由迁移，并以纯 UDP upstream harness 验证；
+2. 实现 Tokio worker shard、有界队列、队列/拒绝指标和 shutdown 控制；
+3. 增加 Cookie 密钥轮换、来源真实 IP 归一化和握手拒绝/重试指标，并为 epoch/key rotation 固化状态机；
 4. 开始 Linux FakeTCP 报文编解码、校验和、AF_PACKET/raw socket 与 cBPF；
 5. 最后接入 route/neighbor Netlink、PMTU 和 Netfilter RST guard。
 

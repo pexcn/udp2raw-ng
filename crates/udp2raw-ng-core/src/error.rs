@@ -24,6 +24,14 @@ pub enum ConfigError {
     HandshakeRetryExceedsTimeout,
     #[error("handshake attempt limit must be greater than zero")]
     ZeroHandshakeAttemptLimit,
+    #[error("reconnect queue capacity must be greater than zero")]
+    ZeroReconnectQueueCapacity,
+    #[error("reconnect queue timeout must be greater than zero")]
+    ZeroReconnectQueueTimeout,
+    #[error("handshake rate-limit burst must be greater than zero")]
+    ZeroHandshakeRateLimitBurst,
+    #[error("handshake rate-limit refill interval must be greater than zero")]
+    ZeroHandshakeRateRefillInterval,
     #[error("handshake cookie lifetime must be greater than zero")]
     ZeroHandshakeCookieLifetime,
     #[error("session resumption lifetime must be greater than zero")]
@@ -140,6 +148,8 @@ pub enum EngineError {
     PendingHandshakeCapacity,
     #[error("per-peer pending handshake capacity has been reached")]
     PerPeerPendingHandshakeCapacity,
+    #[error("unauthenticated handshake rate limit has been reached for this peer")]
+    HandshakeRateLimited,
     #[error("authenticated session capacity has been reached")]
     SessionCapacity,
     #[error("unknown conversation")]

@@ -2,7 +2,7 @@
 
 一个以可复用 Rust 库为核心、面向 Linux FakeTCP UDP 数据报隧道的全新项目。
 
-> **当前状态：阶段 4 的平台无关恢复核心切片，不可用于生产或直接部署到不可信公网。** 核心已实现带无状态 Cookie、丢包重试和受保护最终确认的 PSK 认证握手、五种受保护 record suite、防重放，以及短期恢复凭据驱动的进程内 conversation 状态迁移；CLI 仍会安全拒绝启动真实隧道。Raw socket、AF_PACKET、FakeTCP、真实 upstream socket 迁移、PMTU 探测、完整来源速率限制和 Netfilter RST 抑制尚未实现。
+> **当前状态：阶段 4 的平台无关恢复核心切片，不可用于生产或直接部署到不可信公网。** 核心已实现带无状态 Cookie、丢包重试和受保护最终确认的 PSK 认证握手、五种受保护 record suite、防重放、握手期/重连期有界数据报队列、按路径 `PeerId` 的基础令牌桶握手限速，以及短期恢复凭据驱动的进程内 conversation 状态迁移；CLI 仍会安全拒绝启动真实隧道。Raw socket、AF_PACKET、FakeTCP、真实 upstream socket 迁移、PMTU 探测、来源 IP 归一化与完整抗洪泛指标、Netfilter RST 抑制尚未实现。
 
 完整需求见 [udp2raw-ng-spec.md](docs/udp2raw-ng-spec.md)，当前实现边界见 [docs/implementation-status.md](docs/implementation-status.md)。
 
@@ -28,6 +28,8 @@
 - 同步 `ClientEngine` / `ServerEngine` 会话状态机；
 - 带过期时间的认证恢复凭据、新 session 密钥建立和跨 session conversation 元数据迁移；
 - `SessionResumed` 宿主 action，用于后续 runtime 原子迁移 connected upstream socket 路由键；
+- client 握手期/重连期的严格有界、短时 FIFO 数据报队列，以及队满、超时和关闭的显式丢弃 action；
+- server 在 Cookie 校验前按 `PeerId` 执行的有界令牌桶握手限速；
 - conversation 容量、反向映射、空闲回收和 `(session, conversation)` 隔离基础；
 - `PacketTransport`、有界纯内存双端 transport 和托管服务 API 边界；
 - `client` / `server` CLI 参数骨架，无配置文件入口。

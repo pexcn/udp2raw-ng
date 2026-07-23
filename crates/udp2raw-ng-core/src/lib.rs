@@ -16,7 +16,9 @@ mod replay;
 mod secret;
 
 pub use config::{CipherSuite, EngineConfig, Role};
-pub use engine::{ClientEngine, ServerEngine, SessionState, TunnelAction, TunnelEvent};
+pub use engine::{
+    ClientDatagramDropReason, ClientEngine, ServerEngine, SessionState, TunnelAction, TunnelEvent,
+};
 pub use error::{
     ConfigError, CryptoError, EngineError, FrameError, HandshakeError, RecordError, ReplayError,
 };

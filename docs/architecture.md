@@ -46,3 +46,5 @@ ClientFinish
 ```
 
 The server cookie is bound to the host-assigned `PeerId`, handshake transcript fields, cipher suite and a bounded lifetime. It is authenticated with a process-random secret separate from the PSK. Duplicate validated hellos, finishes and acknowledgements are idempotent. The client remains `Handshaking` until it opens the protected acknowledgement.
+
+While `Handshaking` or `Reconnecting`, the client retains only a bounded number of valid local UDP datagrams for a bounded time. Queue-full, expired, and handshake-closed datagrams produce an explicit `ClientDatagramDropped` action. Only an authenticated `HandshakeAck` releases still-valid datagrams in FIFO order. Before validating a cookie or allocating pending handshake state, the server also applies a bounded per-`PeerId` token bucket to `ClientHello` attempts. `PeerId` remains host-provided routing metadata rather than a stable security identity.
