@@ -48,3 +48,12 @@ ClientFinish
 The server cookie is bound to the host-assigned `PeerId`, handshake transcript fields, cipher suite and a bounded lifetime. It is authenticated with a process-random secret separate from the PSK. Duplicate validated hellos, finishes and acknowledgements are idempotent. The client remains `Handshaking` until it opens the protected acknowledgement.
 
 While `Handshaking` or `Reconnecting`, the client retains only a bounded number of valid local UDP datagrams for a bounded time. Queue-full, expired, and handshake-closed datagrams produce an explicit `ClientDatagramDropped` action. Only an authenticated `HandshakeAck` releases still-valid datagrams in FIFO order. Before validating a cookie or allocating pending handshake state, the server also applies a bounded per-`PeerId` token bucket to `ClientHello` attempts. `PeerId` remains host-provided routing metadata rather than a stable security identity.
+
+The managed service slice owns a normal UDP listener and bounded channels around
+an embedding `PacketTransport`. On the server, every `(SessionId,
+ConversationId)` receives a connected UDP socket to the configured upstream.
+The route survives an idle session close for the authenticated recovery window.
+`SessionResumed` atomically moves it to the replacement session key;
+`SessionRecoveryExpired` finally releases it. The current harness deliberately
+uses one protocol owner per service; session sharding belongs to the future
+FakeTCP runtime.

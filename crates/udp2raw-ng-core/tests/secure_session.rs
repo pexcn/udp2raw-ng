@@ -1299,6 +1299,7 @@ fn server_moves_idle_session_to_resumable_state_before_conversation_expiry() {
     let (client_config, mut server_config) = configs(CipherSuite::ChaCha20Poly1305);
     server_config.conversation_idle_timeout = Duration::from_millis(40);
     server_config.session_idle_timeout = Duration::from_millis(20);
+    server_config.resumption_lifetime = Duration::from_millis(20);
     let (mut client, mut server, client_peer, _, session_id) =
         establish_with_configs(now, client_config, server_config);
     let local_peer: SocketAddr = "127.0.0.1:33001".parse().expect("address");
@@ -1341,10 +1342,13 @@ fn server_moves_idle_session_to_resumable_state_before_conversation_expiry() {
 
     let expired = server
         .handle(
-            TunnelEvent::TimeAdvanced(now + Duration::from_millis(40)),
-            now + Duration::from_millis(40),
+            TunnelEvent::TimeAdvanced(now + Duration::from_millis(50)),
+            now + Duration::from_millis(50),
         )
         .expect("conversation and session expiry");
-    assert!(expired.is_empty());
+    assert!(expired.iter().any(|action| matches!(
+        action,
+        TunnelAction::SessionRecoveryExpired { session_id: id } if *id == session_id
+    )));
     assert_eq!(server.session_state(session_id), None);
 }

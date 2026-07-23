@@ -93,6 +93,11 @@ pub enum TunnelAction {
         peer_id: PeerId,
         session_id: SessionId,
     },
+    /// The server can no longer resume the session, so a host may release
+    /// resources retained solely for its recovery window.
+    SessionRecoveryExpired {
+        session_id: SessionId,
+    },
     ConversationOpened {
         session_id: Option<SessionId>,
         conversation_id: ConversationId,
@@ -1302,7 +1307,15 @@ impl ServerEngine {
                 session_id,
             });
         }
-        self.resumable.retain(|_, state| now < state.expires_at);
+        let expired_resumable: Vec<_> = self
+            .resumable
+            .iter()
+            .filter_map(|(session_id, state)| (now >= state.expires_at).then_some(*session_id))
+            .collect();
+        for session_id in expired_resumable {
+            self.resumable.remove(&session_id);
+            actions.push(TunnelAction::SessionRecoveryExpired { session_id });
+        }
         let bucket_retention = self.config.handshake_rate_refill_interval.saturating_mul(
             u32::try_from(self.config.handshake_rate_limit_burst).unwrap_or(u32::MAX),
         );

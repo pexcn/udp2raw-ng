@@ -2,7 +2,7 @@
 
 一个以可复用 Rust 库为核心、面向 Linux FakeTCP UDP 数据报隧道的全新项目。
 
-> **当前状态：阶段 4 的平台无关恢复核心切片，不可用于生产或直接部署到不可信公网。** 核心已实现带无状态 Cookie、丢包重试和受保护最终确认的 PSK 认证握手、五种受保护 record suite、防重放、握手期/重连期有界数据报队列、按路径 `PeerId` 的基础令牌桶握手限速，以及短期恢复凭据驱动的进程内 conversation 状态迁移；CLI 仍会安全拒绝启动真实隧道。Raw socket、AF_PACKET、FakeTCP、真实 upstream socket 迁移、PMTU 探测、来源 IP 归一化与完整抗洪泛指标、Netfilter RST 抑制尚未实现。
+> **当前状态：阶段 5 的托管 UDP 服务切片，不可用于生产或直接部署到不可信公网。** 核心已实现带无状态 Cookie、丢包重试和受保护最终确认的 PSK 认证握手、五种受保护 record suite、防重放、握手期/重连期有界数据报队列、按路径 `PeerId` 的基础令牌桶握手限速，以及短期恢复凭据驱动的进程内 conversation 状态迁移；官方库现在提供基于可替换 transport 的 Tokio UDP client/server harness，并会在恢复时迁移 connected upstream UDP socket 路由。CLI 仍会安全拒绝启动真实隧道。Raw socket、AF_PACKET、FakeTCP、worker shard、PMTU 探测、来源 IP 归一化与完整抗洪泛指标、Netfilter RST 抑制尚未实现。
 
 完整需求见 [udp2raw-ng-spec.md](docs/udp2raw-ng-spec.md)，当前实现边界见 [docs/implementation-status.md](docs/implementation-status.md)。
 
@@ -10,7 +10,7 @@
 
 - `udp2raw-ng-core`：不依赖 Tokio/Linux I/O 的同步安全协议核心。
 - `udp2raw-ng-net`：可替换 packet transport、纯内存实现及安全失败的 Linux 占位实现。
-- `udp2raw-ng`：官方 CLI 与 Tokio 托管服务 API 骨架。
+- `udp2raw-ng`：官方 CLI 与 Tokio 托管 UDP 服务 API。
 - `fuzz`：帧解码 fuzz target。
 
 ## 当前可用能力
@@ -28,6 +28,7 @@
 - 同步 `ClientEngine` / `ServerEngine` 会话状态机；
 - 带过期时间的认证恢复凭据、新 session 密钥建立和跨 session conversation 元数据迁移；
 - `SessionResumed` 宿主 action，用于后续 runtime 原子迁移 connected upstream socket 路由键；
+- 可嵌入 Tokio UDP client/server harness：有界 transport 收发队列、显式 overload 指标、关闭控制，以及恢复期内保留并在恢复成功时迁移的 connected upstream UDP socket；
 - client 握手期/重连期的严格有界、短时 FIFO 数据报队列，以及队满、超时和关闭的显式丢弃 action；
 - server 在 Cookie 校验前按 `PeerId` 执行的有界令牌桶握手限速；
 - conversation 容量、反向映射、空闲回收和 `(session, conversation)` 隔离基础；
@@ -47,7 +48,7 @@
     cargo run -p udp2raw-ng -- client --help
     cargo run -p udp2raw-ng -- server --help
 
-即使参数有效，非环境检查模式也会以错误退出，因为 Linux FakeTCP 数据面、完整按来源速率限制和运行时服务化尚未实现。
+即使参数有效，非环境检查模式也会以错误退出，因为 Linux FakeTCP 数据面、完整按来源速率限制和 CLI 到托管 UDP 服务的装配尚未实现。
 
 ## Fuzz
 
