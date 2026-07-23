@@ -6,7 +6,8 @@
 
 完整需求见 [udp2raw-ng-spec.md](docs/udp2raw-ng-spec.md)，当前实现边界见 [docs/implementation-status.md](docs/implementation-status.md)。
 
-下一阶段将切换为无心跳、按业务触发的重连模型；具体取舍、协议/API 变更与验收标准见
+下一阶段将切换为无心跳、按业务触发重连的模型，并将数据面从 v3 的 48 字节 header
+迁移为 v4 的 24 字节紧凑 envelope；具体取舍、协议/API 变更与验收标准见
 [docs/next-stage-plan.md](docs/next-stage-plan.md)。在该计划实施前，当前 v3 仍会发送受保护 heartbeat。
 
 ## Workspace
