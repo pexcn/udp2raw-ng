@@ -1,5 +1,5 @@
 use std::fmt;
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
 
 use crate::EngineError;
 
@@ -20,60 +20,60 @@ impl PeerId {
 
 /// Random identifier scoped to an authenticated session.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConversationId(NonZeroU64);
+pub struct ConversationId(NonZeroU32);
 
 impl ConversationId {
     pub fn generate() -> Result<Self, EngineError> {
         loop {
-            let mut bytes = [0_u8; 8];
+            let mut bytes = [0_u8; 4];
             getrandom::getrandom(&mut bytes).map_err(|_| EngineError::RandomnessUnavailable)?;
-            if let Some(value) = NonZeroU64::new(u64::from_be_bytes(bytes)) {
+            if let Some(value) = NonZeroU32::new(u32::from_be_bytes(bytes)) {
                 return Ok(Self(value));
             }
         }
     }
 
-    pub const fn new(value: NonZeroU64) -> Self {
+    pub const fn new(value: NonZeroU32) -> Self {
         Self(value)
     }
 
-    pub const fn get(self) -> u64 {
+    pub const fn get(self) -> u32 {
         self.0.get()
     }
 }
 
 impl fmt::Debug for ConversationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ConversationId({:#018x})", self.get())
+        write!(f, "ConversationId({:#010x})", self.get())
     }
 }
 
 /// Random logical session identifier. It is routing metadata, not a secret.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SessionId(u128);
+pub struct SessionId(u64);
 
 impl SessionId {
     pub fn generate() -> Result<Self, EngineError> {
-        let mut bytes = [0_u8; 16];
+        let mut bytes = [0_u8; 8];
         getrandom::getrandom(&mut bytes).map_err(|_| EngineError::RandomnessUnavailable)?;
-        Ok(Self(u128::from_be_bytes(bytes)))
+        Ok(Self(u64::from_be_bytes(bytes)))
     }
 
-    pub const fn from_u128(value: u128) -> Self {
+    pub const fn from_u64(value: u64) -> Self {
         Self(value)
     }
 
-    pub const fn as_u128(self) -> u128 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 
-    pub const fn to_be_bytes(self) -> [u8; 16] {
+    pub const fn to_be_bytes(self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
 }
 
 impl fmt::Debug for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SessionId({:#034x})", self.0)
+        write!(f, "SessionId({:#018x})", self.0)
     }
 }

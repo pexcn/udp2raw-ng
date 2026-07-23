@@ -950,70 +950,45 @@ fn reconnect_flushes_queued_datagrams_in_fifo_order_after_authenticated_ack() {
 }
 
 #[test]
-fn authenticated_heartbeats_keep_client_and_server_sessions_alive() {
+fn idle_ready_session_emits_no_tunnel_frames() {
     let now = Instant::now();
     let (mut client_config, mut server_config) = configs(CipherSuite::ChaCha20Poly1305);
-    client_config.heartbeat_interval = Duration::from_millis(10);
     client_config.session_timeout = Duration::from_millis(35);
-    server_config.heartbeat_interval = Duration::from_millis(10);
-    server_config.session_timeout = Duration::from_millis(35);
-    server_config.session_idle_timeout = Duration::from_millis(25);
-    let (mut client, mut server, client_peer, server_peer, session_id) =
+    server_config.session_idle_timeout = Duration::from_secs(1);
+    let (mut client, mut server, _, _, session_id) =
         establish_with_configs(now, client_config, server_config);
 
-    for elapsed in [10, 20, 30, 40] {
-        let at = now + Duration::from_millis(elapsed);
-        let heartbeat_actions = client
-            .handle(TunnelEvent::TimeAdvanced(at), at)
-            .expect("heartbeat timer");
-        let (_, heartbeat) = tunnel_frame(&heartbeat_actions);
-        assert_eq!(
-            udp2raw_ng_core::WireFrame::decode(&heartbeat)
-                .expect("heartbeat frame")
-                .frame_type,
-            udp2raw_ng_core::FrameType::Heartbeat
-        );
+    let actions = client
+        .handle(
+            TunnelEvent::TimeAdvanced(now + Duration::from_millis(10)),
+            now + Duration::from_millis(10),
+        )
+        .expect("idle client timer");
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, TunnelAction::SendTunnelFrame { .. }))
+    );
+    assert_eq!(client.state(), SessionState::Ready);
 
-        let reply_actions = server
-            .handle(
-                TunnelEvent::TunnelFrame {
-                    peer_id: client_peer,
-                    bytes: heartbeat,
-                },
-                at,
-            )
-            .expect("server heartbeat");
-        let (_, reply) = tunnel_frame(&reply_actions);
-        client
-            .handle(
-                TunnelEvent::TunnelFrame {
-                    peer_id: server_peer,
-                    bytes: reply,
-                },
-                at,
-            )
-            .expect("client heartbeat reply");
-
-        let server_expiry = server
-            .handle(
-                TunnelEvent::TimeAdvanced(at + Duration::from_millis(9)),
-                at + Duration::from_millis(9),
-            )
-            .expect("server idle timer");
-        assert!(!server_expiry.iter().any(|action| matches!(
-            action,
-            TunnelAction::SessionClosed { session_id: id, .. } if *id == session_id
-        )));
-        assert_eq!(client.state(), SessionState::Ready);
-        assert_eq!(server.session_state(session_id), Some(SessionState::Ready));
-    }
+    let server_actions = server
+        .handle(
+            TunnelEvent::TimeAdvanced(now + Duration::from_millis(10)),
+            now + Duration::from_millis(10),
+        )
+        .expect("idle server timer");
+    assert!(
+        !server_actions
+            .iter()
+            .any(|action| matches!(action, TunnelAction::SendTunnelFrame { .. }))
+    );
+    assert_eq!(server.session_state(session_id), Some(SessionState::Ready));
 }
 
 #[test]
 fn client_timeout_closes_old_session_and_starts_reconnect() {
     let now = Instant::now();
     let (mut client_config, server_config) = configs(CipherSuite::ChaCha20Poly1305);
-    client_config.heartbeat_interval = Duration::from_millis(10);
     client_config.session_timeout = Duration::from_millis(30);
     let (mut client, _, _, server_peer, old_session_id) =
         establish_with_configs(now, client_config, server_config);

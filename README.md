@@ -2,13 +2,12 @@
 
 一个以可复用 Rust 库为核心、面向 Linux FakeTCP UDP 数据报隧道的全新项目。
 
-> **当前状态：阶段 5 的托管 UDP 服务切片，不可用于生产或直接部署到不可信公网。** 核心已实现带无状态 Cookie、丢包重试和受保护最终确认的 PSK 认证握手、五种受保护 record suite、防重放、握手期/重连期有界数据报队列、按路径 `PeerId` 的基础令牌桶握手限速，以及短期恢复凭据驱动的进程内 conversation 状态迁移；官方库现在提供基于可替换 transport 的 Tokio UDP client/server harness，并会在恢复时迁移 connected upstream UDP socket 路由。CLI 仍会安全拒绝启动真实隧道。Raw socket、AF_PACKET、FakeTCP、worker shard、PMTU 探测、来源 IP 归一化与完整抗洪泛指标、Netfilter RST 抑制尚未实现。
+> **当前状态：阶段 5 的轻量协议与托管 UDP 服务切片，不可用于生产或直接部署到不可信公网。** 核心已实现 v4 24 字节固定 envelope、无 heartbeat 的空闲会话、无状态 Cookie、丢包重试和受保护最终确认的 PSK 认证握手、五种受保护 record suite、防重放、握手期/重连期有界数据报队列、按路径 `PeerId` 的基础令牌桶握手限速，以及短期恢复凭据驱动的进程内 conversation 状态迁移；官方库提供基于可替换 transport 的 Tokio UDP client/server harness，并会在恢复时迁移 connected upstream UDP socket 路由。CLI 仍会安全拒绝启动真实隧道。按业务触发重连、独立 conversation handle 映射、Raw socket、AF_PACKET、FakeTCP、worker shard、PMTU 探测、来源 IP 归一化与完整抗洪泛指标、Netfilter RST 抑制尚未实现。
 
 完整需求见 [udp2raw-ng-spec.md](docs/udp2raw-ng-spec.md)，当前实现边界见 [docs/implementation-status.md](docs/implementation-status.md)。
 
-下一阶段将切换为无心跳、按业务触发重连的模型，并将数据面从 v3 的 48 字节 header
-迁移为 v4 的 24 字节紧凑 envelope；具体取舍、协议/API 变更与验收标准见
-[docs/next-stage-plan.md](docs/next-stage-plan.md)。在该计划实施前，当前 v3 仍会发送受保护 heartbeat。
+轻量协议计划及剩余的按业务触发重连、独立 conversation handle 映射工作见
+[docs/next-stage-plan.md](docs/next-stage-plan.md)。当前实现已迁移到 v4，不会发送 heartbeat。
 
 ## Workspace
 

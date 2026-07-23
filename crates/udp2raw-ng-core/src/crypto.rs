@@ -5,7 +5,7 @@ use zeroize::Zeroizing;
 
 use crate::{CipherSuite, CryptoError, Psk, SessionId};
 
-const PROTOCOL_DOMAIN: &[u8] = b"udp2raw-ng/v3";
+const PROTOCOL_DOMAIN: &[u8] = b"udp2raw-ng/v4";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -166,7 +166,7 @@ mod tests {
         let keys = derive_session_keys(
             &psk,
             CipherSuite::ChaCha20Poly1305,
-            SessionId::from_u128(9),
+            SessionId::from_u64(9),
             &[1; 32],
             &[2; 32],
             &[3; 32],

@@ -43,9 +43,6 @@ struct ClientArgs {
     #[arg(long)]
     source_port: Option<NonZeroU16>,
 
-    #[arg(long, default_value_t = 750)]
-    heartbeat_ms: u64,
-
     #[arg(long, default_value_t = 10)]
     session_timeout_secs: u64,
 

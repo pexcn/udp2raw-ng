@@ -8,7 +8,7 @@ use crate::{
     WireFrame,
 };
 
-const RESUMPTION_CREDENTIAL_LENGTH: usize = 104;
+const RESUMPTION_CREDENTIAL_LENGTH: usize = 92;
 const CLIENT_HELLO_BASE_LENGTH: usize = 51;
 const CLIENT_HELLO_COOKIE_LENGTH: usize = CLIENT_HELLO_BASE_LENGTH + 40;
 const CLIENT_HELLO_RESUMPTION_LENGTH: usize =
@@ -120,7 +120,7 @@ impl ClientHello {
 
     pub(crate) fn decode(frame: &WireFrame) -> Result<Self, HandshakeError> {
         if frame.frame_type != FrameType::ClientHello
-            || frame.session_id != SessionId::from_u128(0)
+            || frame.session_id != SessionId::from_u64(0)
             || frame.packet_number != 0
             || frame.epoch != 0
             || !matches!(
@@ -168,7 +168,7 @@ impl ClientHello {
 
     pub(crate) fn frame(&self) -> WireFrame {
         WireFrame {
-            session_id: SessionId::from_u128(0),
+            session_id: SessionId::from_u64(0),
             packet_number: 0,
             epoch: 0,
             frame_type: FrameType::ClientHello,
@@ -209,7 +209,7 @@ impl HelloRetry {
 
     pub(crate) fn decode(frame: &WireFrame) -> Result<Self, HandshakeError> {
         if frame.frame_type != FrameType::HelloRetry
-            || frame.session_id != SessionId::from_u128(0)
+            || frame.session_id != SessionId::from_u64(0)
             || frame.packet_number != 0
             || frame.epoch != 0
             || frame.payload.len() != HELLO_RETRY_LENGTH
@@ -271,7 +271,7 @@ impl HelloRetry {
         let mut payload = self.encode_unsigned_payload();
         payload.extend_from_slice(&self.auth_tag);
         WireFrame {
-            session_id: SessionId::from_u128(0),
+            session_id: SessionId::from_u64(0),
             packet_number: 0,
             epoch: 0,
             frame_type: FrameType::HelloRetry,
@@ -380,7 +380,7 @@ impl ServerHello {
 
     pub(crate) fn decode(frame: &WireFrame) -> Result<Self, HandshakeError> {
         if frame.frame_type != FrameType::ServerHello
-            || frame.session_id == SessionId::from_u128(0)
+            || frame.session_id == SessionId::from_u64(0)
             || frame.packet_number != 0
             || frame.epoch != 0
             || frame.payload.len() != SERVER_HELLO_LENGTH
@@ -460,7 +460,7 @@ impl ClientFinish {
 
     pub(crate) fn decode(frame: &WireFrame) -> Result<Self, HandshakeError> {
         if frame.frame_type != FrameType::ClientFinish
-            || frame.session_id == SessionId::from_u128(0)
+            || frame.session_id == SessionId::from_u64(0)
             || frame.packet_number != 0
             || frame.epoch != 0
             || frame.payload.len() != CLIENT_FINISH_LENGTH
@@ -512,7 +512,7 @@ fn server_auth_transcript(
 ) -> Vec<u8> {
     let mut transcript =
         Vec::with_capacity(16 + CLIENT_HELLO_COOKIE_LENGTH + 16 + SERVER_HELLO_LENGTH);
-    transcript.extend_from_slice(b"udp2raw-ng/v3/server-auth");
+    transcript.extend_from_slice(b"udp2raw-ng/v4/server-auth");
     transcript.extend_from_slice(&client_hello.encode_payload());
     transcript.extend_from_slice(&session_id.to_be_bytes());
     transcript.extend_from_slice(&server_hello.encode_unsigned_payload());
@@ -525,7 +525,7 @@ fn full_transcript(
     server_hello: &ServerHello,
 ) -> Vec<u8> {
     let mut transcript = Vec::with_capacity(CLIENT_HELLO_COOKIE_LENGTH + SERVER_HELLO_LENGTH + 64);
-    transcript.extend_from_slice(b"udp2raw-ng/v3/full-transcript");
+    transcript.extend_from_slice(b"udp2raw-ng/v4/full-transcript");
     transcript.extend_from_slice(&client_hello.encode_payload());
     transcript.extend_from_slice(&session_id.to_be_bytes());
     transcript.extend_from_slice(&server_hello.encode_payload());
@@ -534,7 +534,7 @@ fn full_transcript(
 
 fn retry_auth_transcript(retry: &HelloRetry) -> Vec<u8> {
     let mut transcript = Vec::with_capacity(32 + HELLO_RETRY_UNSIGNED_LENGTH);
-    transcript.extend_from_slice(b"udp2raw-ng/v3/hello-retry-auth");
+    transcript.extend_from_slice(b"udp2raw-ng/v4/hello-retry-auth");
     transcript.extend_from_slice(&retry.encode_unsigned_payload());
     transcript
 }
@@ -553,7 +553,7 @@ fn cookie_tag(
 
 fn cookie_transcript(client_hello: &ClientHello, peer_id: PeerId, issued_at_ms: u64) -> Vec<u8> {
     let mut transcript = Vec::with_capacity(128);
-    transcript.extend_from_slice(b"udp2raw-ng/v3/handshake-cookie");
+    transcript.extend_from_slice(b"udp2raw-ng/v4/handshake-cookie");
     transcript.extend_from_slice(&peer_id.get().to_be_bytes());
     transcript.extend_from_slice(&issued_at_ms.to_be_bytes());
     transcript.extend_from_slice(&client_hello.handshake_id);
@@ -587,12 +587,12 @@ pub(crate) fn issue_resumption_credential(
 ) -> Result<ResumptionCredential, CryptoError> {
     let mut bytes = [0_u8; RESUMPTION_CREDENTIAL_LENGTH];
     getrandom::getrandom(&mut bytes[..32]).map_err(|_| CryptoError::KeyDerivationFailed)?;
-    bytes[32..48].copy_from_slice(&session_id.to_be_bytes());
-    bytes[48..56].copy_from_slice(&conversation_id.get().to_be_bytes());
-    bytes[56..64].copy_from_slice(&issued_at_ms.to_be_bytes());
-    bytes[64..72].copy_from_slice(&expires_at_ms.to_be_bytes());
-    let tag = hmac_tag(secret, &resumption_transcript(&bytes[..72]))?;
-    bytes[72..].copy_from_slice(&tag);
+    bytes[32..40].copy_from_slice(&session_id.to_be_bytes());
+    bytes[40..44].copy_from_slice(&conversation_id.get().to_be_bytes());
+    bytes[44..52].copy_from_slice(&issued_at_ms.to_be_bytes());
+    bytes[52..60].copy_from_slice(&expires_at_ms.to_be_bytes());
+    let tag = hmac_tag(secret, &resumption_transcript(&bytes[..60]))?;
+    bytes[60..].copy_from_slice(&tag);
     Ok(ResumptionCredential::from_bytes(bytes))
 }
 
@@ -602,18 +602,18 @@ pub(crate) fn verify_resumption_credential(
     now_ms: u64,
 ) -> Result<(SessionId, ConversationId), HandshakeError> {
     let bytes = credential.as_bytes();
-    let issued_at_ms = u64::from_be_bytes(bytes[56..64].try_into().expect("fixed slice"));
-    let expires_at_ms = u64::from_be_bytes(bytes[64..72].try_into().expect("fixed slice"));
+    let issued_at_ms = u64::from_be_bytes(bytes[44..52].try_into().expect("fixed slice"));
+    let expires_at_ms = u64::from_be_bytes(bytes[52..60].try_into().expect("fixed slice"));
     if issued_at_ms > now_ms || expires_at_ms < issued_at_ms || now_ms > expires_at_ms {
         return Err(HandshakeError::InvalidResumptionCredential);
     }
-    verify_hmac(secret, &resumption_transcript(&bytes[..72]), &bytes[72..])
+    verify_hmac(secret, &resumption_transcript(&bytes[..60]), &bytes[60..])
         .map_err(|_| HandshakeError::InvalidResumptionCredential)?;
-    let session_id = SessionId::from_u128(u128::from_be_bytes(
-        bytes[32..48].try_into().expect("fixed slice"),
+    let session_id = SessionId::from_u64(u64::from_be_bytes(
+        bytes[32..40].try_into().expect("fixed slice"),
     ));
-    let raw_conversation = u64::from_be_bytes(bytes[48..56].try_into().expect("fixed slice"));
-    let conversation_id = std::num::NonZeroU64::new(raw_conversation)
+    let raw_conversation = u32::from_be_bytes(bytes[40..44].try_into().expect("fixed slice"));
+    let conversation_id = std::num::NonZeroU32::new(raw_conversation)
         .map(ConversationId::new)
         .ok_or(HandshakeError::InvalidResumptionCredential)?;
     Ok((session_id, conversation_id))
@@ -621,7 +621,7 @@ pub(crate) fn verify_resumption_credential(
 
 fn resumption_transcript(unsigned: &[u8]) -> Vec<u8> {
     let mut transcript = Vec::with_capacity(32 + unsigned.len());
-    transcript.extend_from_slice(b"udp2raw-ng/v3/resumption-credential");
+    transcript.extend_from_slice(b"udp2raw-ng/v4/resumption-credential");
     transcript.extend_from_slice(unsigned);
     transcript
 }

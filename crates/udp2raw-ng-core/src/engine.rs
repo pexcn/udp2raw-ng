@@ -147,7 +147,6 @@ struct ClientSession {
     sealer: RecordSealer,
     opener: RecordOpener,
     last_received_at: Instant,
-    last_heartbeat_sent_at: Instant,
     resumed: bool,
 }
 
@@ -380,7 +379,6 @@ impl ClientEngine {
             self.handshake = None;
             self.state = SessionState::Ready;
             session.last_received_at = now;
-            session.last_heartbeat_sent_at = now;
             let mut actions = Vec::new();
             if attempted_resumption && !resumed {
                 let stale: Vec<_> = self
@@ -403,16 +401,13 @@ impl ClientEngine {
                 resumed,
             });
             actions.extend(self.flush_queued_datagrams(now));
-            actions.push(TunnelAction::ScheduleTimer(self.config.heartbeat_interval));
+            actions.push(TunnelAction::ScheduleTimer(self.config.session_timeout));
             return Ok(actions);
         }
         if self.state != SessionState::Ready {
             return Err(EngineError::SessionNotReady);
         }
         session.last_received_at = now;
-        if frame.frame_type == FrameType::Heartbeat {
-            return Ok(Vec::new());
-        }
         if frame.frame_type == FrameType::ResumptionCredential {
             let id = frame
                 .conversation_id
@@ -548,7 +543,6 @@ impl ClientEngine {
                 self.config.replay_window_size,
             ),
             last_received_at: now,
-            last_heartbeat_sent_at: now,
             resumed: server_hello.resumed,
         });
         handshake.phase = ClientHandshakePhase::AwaitingServerAck {
@@ -617,30 +611,6 @@ impl ClientEngine {
             });
             if timed_out {
                 actions.extend(self.begin_reconnect(now));
-            } else if self.session.as_ref().is_some_and(|session| {
-                now.saturating_duration_since(session.last_heartbeat_sent_at)
-                    >= self.config.heartbeat_interval
-            }) {
-                let heartbeat = self
-                    .session
-                    .as_mut()
-                    .expect("ready client has a session")
-                    .sealer
-                    .seal(FrameType::Heartbeat, None, &[]);
-                match heartbeat {
-                    Ok(bytes) => {
-                        self.session
-                            .as_mut()
-                            .expect("ready client has a session")
-                            .last_heartbeat_sent_at = now;
-                        actions.push(TunnelAction::SendTunnelFrame {
-                            peer_id: self.server_peer,
-                            bytes,
-                        });
-                        actions.push(TunnelAction::ScheduleTimer(self.config.heartbeat_interval));
-                    }
-                    Err(_) => actions.extend(self.begin_reconnect(now)),
-                }
             }
         }
         actions.extend(self.expire_queued_datagrams(now));
@@ -935,9 +905,10 @@ impl ServerEngine {
         }
         let session_id = loop {
             let candidate = SessionId::generate()?;
-            if candidate != SessionId::from_u128(0)
+            if candidate != SessionId::from_u64(0)
                 && !self.pending.contains_key(&candidate)
                 && !self.sessions.contains_key(&candidate)
+                && !self.resumable.contains_key(&candidate)
             {
                 break candidate;
             }
@@ -1127,13 +1098,6 @@ impl ServerEngine {
         let frame = session.opener.open(&bytes)?;
         session.last_activity = now;
         session.expires_at = now + self.config.session_idle_timeout;
-        if frame.frame_type == FrameType::Heartbeat {
-            let bytes = session.sealer.seal(FrameType::Heartbeat, None, &[])?;
-            return Ok(vec![
-                TunnelAction::SendTunnelFrame { peer_id, bytes },
-                TunnelAction::ScheduleTimer(self.config.session_idle_timeout),
-            ]);
-        }
         if frame.frame_type != FrameType::Data {
             return Ok(Vec::new());
         }

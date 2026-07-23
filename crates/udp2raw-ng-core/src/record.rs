@@ -71,11 +71,11 @@ impl RecordSealer {
             conversation_id,
             payload: Vec::new(),
         };
-        let wire_body_length = plaintext
+        plaintext
             .len()
             .checked_add(tag_length)
             .ok_or(crate::FrameError::PayloadTooLarge)?;
-        let aad = self.aad(&frame, wire_body_length)?;
+        let aad = self.aad(&frame)?;
         let mut body = plaintext.to_vec();
         match self.suite {
             CipherSuite::ChaCha20Poly1305 => {
@@ -133,9 +133,9 @@ impl RecordSealer {
         }
     }
 
-    fn aad(&self, frame: &WireFrame, body_length: usize) -> Result<Vec<u8>, crate::FrameError> {
+    fn aad(&self, frame: &WireFrame) -> Result<Vec<u8>, crate::FrameError> {
         let mut aad = Vec::with_capacity(crate::protocol::HEADER_LENGTH + 2);
-        aad.extend_from_slice(&frame.encoded_header(body_length)?);
+        aad.extend_from_slice(&frame.encoded_header()?);
         aad.push(self.direction.wire_id());
         aad.push(self.suite.wire_id());
         Ok(aad)
@@ -198,7 +198,7 @@ impl RecordOpener {
             return Err(RecordError::TruncatedTag);
         }
         let mut aad = Vec::with_capacity(crate::protocol::HEADER_LENGTH + 2);
-        aad.extend_from_slice(&frame.encoded_header(frame.payload.len())?);
+        aad.extend_from_slice(&frame.encoded_header()?);
         aad.push(self.direction.wire_id());
         aad.push(self.suite.wire_id());
 

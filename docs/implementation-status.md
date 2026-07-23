@@ -2,7 +2,7 @@
 
 ## 本轮目标
 
-本轮实现托管 Tokio UDP 服务切片：在内存或调用方自定义的受保护 frame transport 上，client 可监听真实 UDP，server 可为每个 conversation 使用 connected UDP upstream socket；服务会执行 `SessionResumed` 路由迁移，并在恢复窗口最终到期后释放旧路由。恢复仍是进程内、短期且单服务器的，不是跨进程 stable identity；真实 Linux FakeTCP 数据面仍不在本轮范围内。
+本轮完成轻量协议的首个可运行切片：内层协议升级为 v4，采用 24 字节固定 datagram envelope、64 位 session ID 与 32 位 conversation ID，并移除 heartbeat frame 与周期性保活路径。v4 仍保持 PSK 握手、方向密钥、完整认证和防重放；按业务触发重连的完整状态机与 Linux FakeTCP 数据面仍在后续范围内。
 
 ## 已实现
 
@@ -12,7 +12,7 @@
 - 平台无关、同步、事件驱动的 `ClientEngine` / `ServerEngine`；
 - `PeerId` transport 路由标识，以及带目标/来源 peer 的 tunnel action/event；
 - `Idle`、`Handshaking`、`Ready`、`Reconnecting`、`Closed` 会话状态模型；
-- client 在 `Ready` 下按配置间隔发送受保护 heartbeat，server 认证后回送受保护 heartbeat；
+- v4 已建立会话在空闲时不发送 tunnel frame；已移除 client/server heartbeat 发送、回应和 `EngineConfig::heartbeat_interval`；
 - client 仅以成功认证的 server record 刷新接收活性，超时后关闭旧 session 并自动进入 `Reconnecting`；
 - 支持显式 `Reconnect` 事件，重连期间拒绝业务数据，握手成功后回到 `Ready`；
 - client 在 `Handshaking` 或 `Reconnecting` 时将合规本地 UDP 数据报放入严格有界 FIFO；队列已满、等待超时或握手失败关闭时，以可观测 action 丢弃，认证 `HandshakeAck` 后按 FIFO 顺序投递未过期数据；
@@ -27,10 +27,12 @@
 - 托管服务暴露 transport queue、client 暂存队列、upstream 和内部 engine 错误的基础丢弃/错误计数；
 - client 只有在认证 `HandshakeAck` 确认 `resumed=true` 后保留 conversation 映射；凭据无效/过期或 server 状态缺失时安全回退到新 session 并关闭旧本地映射；
 - server 跟踪认证入站 record 和 upstream 回包活动，空闲 session 关闭后可在配置的短期恢复窗口内保留 conversation/upstream 元数据；
-- session 建立、heartbeat/data 活动和重连均返回宿主可执行的单调时钟定时 action；
+- session 建立、认证 data/恢复活动和重连均返回宿主可执行的单调时钟定时 action；
 - conversation 容量、空闲回收、反向映射和 `(session, conversation)` 隔离；
 - PSK 长度限制、调试输出脱敏和 drop 时清零；
-- 协议版本提升到 v3，旧版本帧不会被接受。
+- 协议版本提升到 v4，v3 `U2NG` envelope、保留 heartbeat type、非零 flags、未知 epoch 和非法 conversation 字段均在认证前显式拒绝；
+- v4 使用固定 24 字节 envelope：版本 discriminator、frame type、8 位 epoch、flags、64 位 session ID、64 位 packet number 和 session 作用域 32 位 conversation ID；body 长度从 datagram 边界推导并进入认证上下文；
+- 默认业务 payload 上限暂降至保守的 1150 字节，避免未来 FakeTCP/IP transport 发生外层分片；后续 PMTU 实现将按路径调整该值；
 
 ### 握手与密钥派生
 
@@ -61,7 +63,7 @@
 - `none` 认证明文模式：payload 不加密，但使用完整 HMAC-SHA256 tag；
 - 受保护 `ResumptionCredential` record 类型，和 data/heartbeat 共享方向密钥、防重放及认证边界；
 - 每方向独立 packet number 和 nonce prefix；
-- header、协议版本、session、epoch、packet number、frame type、conversation、方向、cipher suite 和长度均绑定到认证上下文；
+- 紧凑 envelope、协议版本、session、epoch、packet number、frame type、conversation、方向、cipher suite 和由 datagram 推导的 body 长度均绑定到认证上下文；
 - 非零 epoch、错误 session、错误方向、截断 tag、非法 record 类型和畸形长度均拒绝；
 - packet number 溢出时安全失败并要求新 session；
 - 防重放滑动窗口已接入唯一 record 打开入口，顺序固定为“先认证、再更新 replay window、最后返回明文”；
@@ -76,14 +78,14 @@
 - Cookie 来源绑定、过期、per-peer pending 限制和按 `PeerId` 令牌桶限速/恢复测试；
 - 错 PSK、suite 不一致、密文/tag 篡改、重复 record、认证失败后合法同 packet number 仍可接受的测试；
 - 非 `Ready` 状态业务数据拒绝；
-- 认证 heartbeat 往返和持续保活测试；
+- 空闲 `Ready` 会话不产生 tunnel frame 的测试；
 - client 超时自动重连、显式重连、重连握手超时关闭测试；
 - 重连队列容量、超时丢弃和认证建立后 FIFO 投递测试；
 - 有效恢复凭据下跨 session 沿用 conversation、双向继续投递、旧 session 失效和 `SessionResumed` action 测试；
 - 恢复凭据过期时不迁移 server 状态、client 清理旧映射并创建新 conversation 的安全回退测试；
 - server 空闲 session 转为短期可恢复状态且不立即关闭 upstream conversation 的测试；
 - 内存 transport 上的 Tokio client/service/server/upstream UDP 往返和关闭控制集成测试；
-- 基础帧所有截断位置和 trailing bytes 拒绝测试；
+- v4 固定头截断、datagram body 长度推导、legacy magic、保留 heartbeat type 与非零 flags 拒绝测试；
 - 帧解码 fuzz target；
 - `cargo fmt --check`、严格 Clippy 和 workspace 测试作为验收项。
 
@@ -94,7 +96,7 @@
 - 跨进程/多节点 stable client identity、持久化或可轮换恢复凭据密钥、恢复状态复制，以及密钥轮换/非零 epoch；
 - 重连退避/抖动和宿主网络路径切换；
 - AES 硬件加速实际启用/软件回退的可观测指标；
-- PMTU 探测、可信 ICMP 关联和 MTU 事件；
+- PMTU 探测、可信 ICMP 关联和 MTU 事件；当前 1150 字节保守上限尚未按路径动态调整；
 - 多 worker shard 的 session 稳定哈希、跨 shard dispatch 和每 shard 有界 runtime 队列；当前托管 UDP harness 为保证 engine 单所有者而明确限制为一个 packet worker；
 - FakeTCP 状态机和 IP/TCP 报文编解码；
 - Raw socket、AF_PACKET、cBPF、route/neighbor Netlink；
@@ -103,9 +105,9 @@
 
 ## 当前安全边界
 
-平台无关的 v3 内层协议已经提供 PSK 身份证明、完整性、防重放，以及除 `none` 外的机密性；`none` 只暴露 payload 内容，不会关闭握手认证、record 认证或防重放。未经认证的网络帧不能创建已认证 session、创建 conversation 或投递应用明文。
+平台无关的 v4 内层协议已经提供 PSK 身份证明、完整性、防重放，以及除 `none` 外的机密性；`none` 只暴露 payload 内容，不会关闭握手认证、record 认证或防重放。未经认证的网络帧不能创建已认证 session、创建 conversation 或投递应用明文。v4 是 datagram-only codec：body 边界由 transport datagram 提供，不支持 stream 拼接；应用层压缩不由 tunnel 自动执行。
 
-client 不再在发出 `ClientFinish` 后乐观进入 `Ready`；只有受保护 server ack 通过 record 认证和防重放后才建立会话。`Ready` 状态下的 heartbeat、数据和恢复凭据共享同一 record 认证、防重放和方向密钥边界；未认证输入不能刷新 session 活性。client 超时会放弃旧 record 状态并发起全新握手；即使恢复成功，新 session 也使用全新密钥、nonce prefix、packet number 和 replay window。
+client 不再在发出 `ClientFinish` 后乐观进入 `Ready`；只有受保护 server ack 通过 record 认证和防重放后才建立会话。`Ready` 状态下的数据和恢复凭据共享同一 record 认证、防重放和方向密钥边界；未认证输入不能刷新 session 活性。当前空闲会话不会发送心跳；client 超时仍会放弃旧 record 状态并发起全新握手。即使恢复成功，新 session 也使用全新密钥、nonce prefix、packet number 和 replay window。
 
 当前恢复凭据由服务端进程随机秘密签发，默认短期有效并仅引用服务端仍保留的内存状态；服务重启、状态过期、凭据篡改或状态缺失都会安全回退为非恢复握手。恢复成功只在新握手完成后发生，旧 session 随即失效；旧路径迟到 record 不会被新 session 接受。托管 server 会在 session idle close 后保留 connected upstream socket 路由到恢复窗口结束；恢复成功时随 `SessionResumed` 移至新 session，最终过期时才释放。client 仅在握手或重连状态暂存合规数据报，严格按容量和时限丢弃；不会在 `Closed` 状态继续积压明文。server 的 Cookie 前令牌桶限制单个宿主 `PeerId` 的 handshake 尝试，但该标识由宿主提供，不是来源 IP 身份，尚不足以抵御分布式攻击。当前实现仍不能宣称适合直接部署到不可信公网：尚无来源 IP 归一化、分布式攻击缓解、Cookie/恢复密钥轮换和对应指标。`PeerId` 由宿主分配，是 Cookie 的路径绑定输入和路由元数据，不是稳定安全身份；宿主必须保证同一路径在握手期间映射稳定且攻击者不能任意冒用。
 
@@ -113,10 +115,11 @@ client 不再在发出 `ClientFinish` 后乐观进入 `Ready`；只有受保护 
 
 ## 下一阶段建议
 
-1. 实现 Tokio worker shard、稳定 session 哈希和跨 shard 有界 dispatch；
-2. 为托管服务增加全面的队列/拒绝指标、观测 API 与 shutdown drain 策略；
-3. 增加 Cookie 密钥轮换、来源真实 IP 归一化和握手拒绝/重试指标，并为 epoch/key rotation 固化状态机；
-4. 开始 Linux FakeTCP 报文编解码、校验和、AF_PACKET/raw socket 与 cBPF；
-5. 最后接入 route/neighbor Netlink、PMTU 和 Netfilter RST guard。
+1. 完成按业务触发的 client 重连：在本地业务到达时检查认证 server 活性，超时则先握手/恢复并将数据报放入既有有界队列；
+2. 为 v4 增加 session 作用域 conversation handle 分配、映射、恢复迁移和碰撞测试；当前 wire ID 已缩至 32 位，但 core 逻辑映射尚未分离；
+3. 为托管服务增加全面的队列/拒绝指标、观测 API 与 shutdown drain 策略，并重新按 v4 开销计算 MTU；
+4. 实现 Tokio worker shard、稳定 session 哈希和跨 shard 有界 dispatch；
+5. 增加 Cookie 密钥轮换、来源真实 IP 归一化和握手拒绝/重试指标，并为 epoch/key rotation 固化状态机；
+6. 开始 Linux FakeTCP 报文编解码、校验和、AF_PACKET/raw socket 与 cBPF，最后接入 route/neighbor Netlink、PMTU 和 Netfilter RST guard。
 
 当前阶段不需要 root、`CAP_NET_RAW`、network namespace 或 Netfilter 权限。真实 Linux 网络层阶段才需要这些条件。

@@ -1,6 +1,6 @@
 # 下一阶段实施计划：无心跳、轻量协议与低损耗会话
 
-> **状态：计划，尚未实现。** 当前 v3 实现仍会周期性发送并回应受保护的 heartbeat。本计划确定下一阶段将其移除；在实现完成前，不能把当前实现描述为“无心跳”。
+> **状态：部分完成。** 已实现 v4 的 24 字节固定 envelope、64 位 session ID、32 位 wire conversation ID、由 datagram 边界推导并认证的 body length、保留 heartbeat type 拒绝、保守 1150 字节 payload 上限，以及移除 heartbeat 的核心路径。按业务触发重连和逻辑 `ConversationId` 到 session 作用域 handle 的独立映射仍未完成。
 
 ## 目标与取舍
 
