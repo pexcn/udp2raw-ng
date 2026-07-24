@@ -43,6 +43,10 @@ struct ClientArgs {
     #[arg(long)]
     source_port: Option<NonZeroU16>,
 
+    /// Liveness threshold used only when local business data arrives: if the
+    /// last authenticated server-direction activity is older than this, the
+    /// client reconnects on demand before sending. Idle sessions never send
+    /// heartbeats or reconnect on their own.
     #[arg(long, default_value_t = 10)]
     session_timeout_secs: u64,
 

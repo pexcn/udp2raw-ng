@@ -280,22 +280,26 @@ impl ClientEngine {
         if payload.len() > self.config.max_frame_payload {
             return Err(EngineError::PayloadTooLarge);
         }
+        // On-demand reconnect: a `Ready` session whose authenticated
+        // server-direction activity has aged past `session_timeout` is treated as
+        // stale. Instead of sending business data on a possibly dead session, start
+        // a fresh handshake and hold the triggering datagram in the bounded
+        // reconnect queue. Idle sessions never reconnect on their own.
+        if self.state == SessionState::Ready && self.ready_session_is_stale(now) {
+            let mut actions = self.begin_reconnect(now);
+            if self.is_handshaking() {
+                actions.extend(self.enqueue_reconnect_datagram(local_peer, payload, now));
+            } else {
+                actions.push(TunnelAction::ClientDatagramDropped {
+                    local_peer,
+                    reason: ClientDatagramDropReason::SessionClosed,
+                });
+            }
+            return Ok(actions);
+        }
         if self.state != SessionState::Ready {
             if self.is_handshaking() {
-                if self.queued_datagrams.len() >= self.config.reconnect_queue_capacity {
-                    return Ok(vec![TunnelAction::ClientDatagramDropped {
-                        local_peer,
-                        reason: ClientDatagramDropReason::ReconnectQueueFull,
-                    }]);
-                }
-                self.queued_datagrams.push_back(QueuedClientDatagram {
-                    local_peer,
-                    payload: Zeroizing::new(payload),
-                    queued_at: now,
-                });
-                return Ok(vec![TunnelAction::ScheduleTimer(
-                    self.config.reconnect_queue_timeout,
-                )]);
+                return Ok(self.enqueue_reconnect_datagram(local_peer, payload, now));
             }
             return Err(EngineError::SessionNotReady);
         }
@@ -604,15 +608,10 @@ impl ClientEngine {
                     ));
                 }
             }
-        } else if self.state == SessionState::Ready {
-            let timed_out = self.session.as_ref().is_some_and(|session| {
-                now.saturating_duration_since(session.last_received_at)
-                    >= self.config.session_timeout
-            });
-            if timed_out {
-                actions.extend(self.begin_reconnect(now));
-            }
         }
+        // A `Ready` but idle session is intentionally left untouched here: with no
+        // heartbeat and no periodic probe, the engine emits no tunnel traffic while
+        // idle. Staleness is evaluated only when local business data arrives.
         actions.extend(self.expire_queued_datagrams(now));
         let timeout = self.config.conversation_idle_timeout;
         let expired: Vec<_> = self
@@ -632,6 +631,34 @@ impl ClientEngine {
             }
         }));
         actions
+    }
+
+    fn ready_session_is_stale(&self, now: Instant) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            now.saturating_duration_since(session.last_received_at) >= self.config.session_timeout
+        })
+    }
+
+    fn enqueue_reconnect_datagram(
+        &mut self,
+        local_peer: SocketAddr,
+        payload: Vec<u8>,
+        now: Instant,
+    ) -> Vec<TunnelAction> {
+        if self.queued_datagrams.len() >= self.config.reconnect_queue_capacity {
+            return vec![TunnelAction::ClientDatagramDropped {
+                local_peer,
+                reason: ClientDatagramDropReason::ReconnectQueueFull,
+            }];
+        }
+        self.queued_datagrams.push_back(QueuedClientDatagram {
+            local_peer,
+            payload: Zeroizing::new(payload),
+            queued_at: now,
+        });
+        vec![TunnelAction::ScheduleTimer(
+            self.config.reconnect_queue_timeout,
+        )]
     }
 
     fn begin_reconnect(&mut self, now: Instant) -> Vec<TunnelAction> {

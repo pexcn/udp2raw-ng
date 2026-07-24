@@ -2,7 +2,7 @@
 
 ## 本轮目标
 
-本轮完成轻量协议的首个可运行切片：内层协议升级为 v4，采用 24 字节固定 datagram envelope、64 位 session ID 与 32 位 conversation ID，并移除 heartbeat frame 与周期性保活路径。v4 仍保持 PSK 握手、方向密钥、完整认证和防重放；按业务触发重连的完整状态机与 Linux FakeTCP 数据面仍在后续范围内。
+本轮完成轻量协议的首个可运行切片：内层协议升级为 v4，采用 24 字节固定 datagram envelope、64 位 session ID 与 32 位 conversation ID，并移除 heartbeat frame 与周期性保活路径。会话已切换为无心跳、按业务触发的重连模型：空闲会话不再发送任何 tunnel frame，也不会因超时自行重连；只有本地业务数据在认证回程活性过期时到达，才触发一次新握手并把首包放入既有有界队列。v4 仍保持 PSK 握手、方向密钥、完整认证和防重放；Linux FakeTCP 数据面仍在后续范围内。
 
 ## 已实现
 
@@ -13,8 +13,9 @@
 - `PeerId` transport 路由标识，以及带目标/来源 peer 的 tunnel action/event；
 - `Idle`、`Handshaking`、`Ready`、`Reconnecting`、`Closed` 会话状态模型；
 - v4 已建立会话在空闲时不发送 tunnel frame；已移除 client/server heartbeat 发送、回应和 `EngineConfig::heartbeat_interval`；
-- client 仅以成功认证的 server record 刷新接收活性，超时后关闭旧 session 并自动进入 `Reconnecting`；
-- 支持显式 `Reconnect` 事件，重连期间拒绝业务数据，握手成功后回到 `Ready`；
+- client 仅以成功认证的 server record 刷新接收活性；空闲会话保持 `Ready` 且不自动重连，`session_timeout` 仅作为“本地业务到达前判断旧会话是否仍可用”的活性阈值；
+- 本地业务数据到达时，若认证回程活性已超过 `session_timeout`，先关闭旧 record 状态并发起新握手，同时把触发数据报放入有界重连队列，绝不在可能失效的旧 session 上发送；
+- 支持显式 `Reconnect` 事件，重连期间业务数据进入有界队列，握手成功后回到 `Ready`；
 - client 在 `Handshaking` 或 `Reconnecting` 时将合规本地 UDP 数据报放入严格有界 FIFO；队列已满、等待超时或握手失败关闭时，以可观测 action 丢弃，认证 `HandshakeAck` 后按 FIFO 顺序投递未过期数据；
 - 暂存队列按数据报数限制，且每个元素受 `max_frame_payload` 限制；暂存明文以 `Zeroizing` 保存，丢弃或投递后清零；
 - 重连始终建立新的随机 session、方向密钥、packet number 与 replay window，绝不复用旧 record 状态；
@@ -79,7 +80,8 @@
 - 错 PSK、suite 不一致、密文/tag 篡改、重复 record、认证失败后合法同 packet number 仍可接受的测试；
 - 非 `Ready` 状态业务数据拒绝；
 - 空闲 `Ready` 会话不产生 tunnel frame 的测试；
-- client 超时自动重连、显式重连、重连握手超时关闭测试；
+- 空闲的过期会话不自行重连、本地业务到达时才按需重连（首包不走旧 session）的测试；
+- 显式重连、重连握手超时关闭测试；
 - 重连队列容量、超时丢弃和认证建立后 FIFO 投递测试；
 - 有效恢复凭据下跨 session 沿用 conversation、双向继续投递、旧 session 失效和 `SessionResumed` action 测试；
 - 恢复凭据过期时不迁移 server 状态、client 清理旧映射并创建新 conversation 的安全回退测试；

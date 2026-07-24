@@ -986,17 +986,52 @@ fn idle_ready_session_emits_no_tunnel_frames() {
 }
 
 #[test]
-fn client_timeout_closes_old_session_and_starts_reconnect() {
+fn idle_stale_session_does_not_reconnect_without_business_data() {
+    let now = Instant::now();
+    let (mut client_config, server_config) = configs(CipherSuite::ChaCha20Poly1305);
+    client_config.session_timeout = Duration::from_millis(30);
+    let (mut client, _, _, _, session_id) =
+        establish_with_configs(now, client_config, server_config);
+
+    // Advancing time well past `session_timeout` on an idle session must not
+    // emit any tunnel frame or tear the session down on its own.
+    let idle_at = now + Duration::from_millis(90);
+    let actions = client
+        .handle(TunnelEvent::TimeAdvanced(idle_at), idle_at)
+        .expect("idle timer");
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, TunnelAction::SendTunnelFrame { .. }))
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, TunnelAction::SessionClosed { .. }))
+    );
+    assert_eq!(client.state(), SessionState::Ready);
+    assert_eq!(client.session_id(), Some(session_id));
+}
+
+#[test]
+fn local_business_on_stale_session_triggers_on_demand_reconnect() {
     let now = Instant::now();
     let (mut client_config, server_config) = configs(CipherSuite::ChaCha20Poly1305);
     client_config.session_timeout = Duration::from_millis(30);
     let (mut client, _, _, server_peer, old_session_id) =
         establish_with_configs(now, client_config, server_config);
 
-    let timed_out_at = now + Duration::from_millis(30);
+    let local_peer: SocketAddr = "127.0.0.1:33900".parse().expect("address");
+    let stale_at = now + Duration::from_millis(45);
     let actions = client
-        .handle(TunnelEvent::TimeAdvanced(timed_out_at), timed_out_at)
-        .expect("session timeout");
+        .handle(
+            TunnelEvent::ClientDatagram {
+                local_peer,
+                payload: b"first packet after idle".to_vec(),
+            },
+            stale_at,
+        )
+        .expect("on-demand reconnect");
 
     assert_eq!(client.state(), SessionState::Reconnecting);
     assert_eq!(client.session_id(), None);
@@ -1005,6 +1040,8 @@ fn client_timeout_closes_old_session_and_starts_reconnect() {
         TunnelAction::SessionClosed { peer_id, session_id }
             if *peer_id == server_peer && *session_id == old_session_id
     )));
+    // The triggering datagram must not be sent on the stale session; only a
+    // fresh ClientHello leaves the client until the handshake completes.
     let (_, hello) = tunnel_frame(&actions);
     assert_eq!(
         udp2raw_ng_core::WireFrame::decode(&hello)
@@ -1012,6 +1049,7 @@ fn client_timeout_closes_old_session_and_starts_reconnect() {
             .frame_type,
         udp2raw_ng_core::FrameType::ClientHello
     );
+    assert_eq!(tunnel_frames(&actions).len(), 1);
 }
 
 #[test]
