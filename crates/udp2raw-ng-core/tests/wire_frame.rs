@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use udp2raw_ng_core::{ConversationId, FrameError, FrameType, SessionId, WireFrame};
+use udp2raw_ng_core::{ConversationHandle, FrameError, FrameType, SessionId, WireFrame};
 
 fn sample_frame() -> WireFrame {
     WireFrame {
@@ -8,7 +8,9 @@ fn sample_frame() -> WireFrame {
         packet_number: 7,
         epoch: 0,
         frame_type: FrameType::Data,
-        conversation_id: Some(ConversationId::new(NonZeroU32::new(9).expect("non-zero"))),
+        conversation_handle: Some(ConversationHandle::new(
+            NonZeroU32::new(9).expect("non-zero"),
+        )),
         payload: b"hello".to_vec(),
     }
 }
@@ -19,6 +21,15 @@ fn frame_round_trip() {
     let encoded = frame.encode().expect("encode");
     assert_eq!(encoded.len(), 24 + frame.payload.len());
     assert_eq!(WireFrame::decode(&encoded).expect("decode"), frame);
+}
+
+#[test]
+fn zero_conversation_field_decodes_as_no_wire_handle() {
+    let mut frame = sample_frame();
+    frame.frame_type = FrameType::HandshakeAck;
+    frame.conversation_handle = None;
+    let decoded = WireFrame::decode(&frame.encode().expect("encode")).expect("decode");
+    assert_eq!(decoded.conversation_handle, None);
 }
 
 #[test]

@@ -11,8 +11,8 @@ use crate::handshake::{
 };
 use crate::record::{RecordOpener, RecordSealer};
 use crate::{
-    CipherSuite, ConversationId, EngineConfig, EngineError, FrameType, PeerId, Psk, Role,
-    SessionId, WireFrame,
+    CipherSuite, ConversationHandle, ConversationId, EngineConfig, EngineError, FrameType, PeerId,
+    Psk, Role, SessionId, WireFrame,
 };
 
 /// High-level authenticated session state.
@@ -148,6 +148,71 @@ struct ClientSession {
     opener: RecordOpener,
     last_received_at: Instant,
     resumed: bool,
+    handles: SessionConversationHandles,
+    resumption_source: Option<SessionId>,
+}
+
+struct SessionConversationHandles {
+    by_handle: HashMap<ConversationHandle, ConversationId>,
+    by_id: HashMap<ConversationId, ConversationHandle>,
+    next_handle: u32,
+}
+
+impl SessionConversationHandles {
+    fn new() -> Self {
+        Self {
+            by_handle: HashMap::new(),
+            by_id: HashMap::new(),
+            next_handle: 1,
+        }
+    }
+
+    fn handle_for_or_allocate(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<ConversationHandle, EngineError> {
+        if let Some(handle) = self.by_id.get(&conversation_id) {
+            return Ok(*handle);
+        }
+        let raw = self.next_handle;
+        self.next_handle = self
+            .next_handle
+            .checked_add(1)
+            .ok_or(EngineError::ConversationHandleExhausted)?;
+        let handle = ConversationHandle::new(
+            std::num::NonZeroU32::new(raw).expect("handle allocator never emits zero"),
+        );
+        self.by_handle.insert(handle, conversation_id);
+        self.by_id.insert(conversation_id, handle);
+        Ok(handle)
+    }
+
+    fn id_for(&self, handle: ConversationHandle) -> Option<ConversationId> {
+        self.by_handle.get(&handle).copied()
+    }
+
+    fn bind(
+        &mut self,
+        handle: ConversationHandle,
+        conversation_id: ConversationId,
+    ) -> Result<(), EngineError> {
+        if self.by_handle.contains_key(&handle) || self.by_id.contains_key(&conversation_id) {
+            return Err(EngineError::UnknownConversation);
+        }
+        self.by_handle.insert(handle, conversation_id);
+        self.by_id.insert(conversation_id, handle);
+        Ok(())
+    }
+
+    fn handle_for(&self, conversation_id: ConversationId) -> Option<ConversationHandle> {
+        self.by_id.get(&conversation_id).copied()
+    }
+
+    fn remove(&mut self, conversation_id: ConversationId) {
+        if let Some(handle) = self.by_id.remove(&conversation_id) {
+            self.by_handle.remove(&handle);
+        }
+    }
 }
 
 pub struct ClientEngine {
@@ -328,9 +393,10 @@ impl ClientEngine {
             id
         };
         let session = self.session.as_mut().ok_or(EngineError::SessionNotReady)?;
+        let conversation_handle = session.handles.handle_for_or_allocate(conversation_id)?;
         let bytes = session
             .sealer
-            .seal(FrameType::Data, Some(conversation_id), &payload);
+            .seal(FrameType::Data, Some(conversation_handle), &payload);
         payload.zeroize();
         let bytes = bytes?;
         actions.push(TunnelAction::SendTunnelFrame {
@@ -385,6 +451,7 @@ impl ClientEngine {
             session.last_received_at = now;
             let mut actions = Vec::new();
             if attempted_resumption && !resumed {
+                session.handles = SessionConversationHandles::new();
                 let stale: Vec<_> = self
                     .by_peer
                     .drain()
@@ -398,12 +465,37 @@ impl ClientEngine {
                     }
                 }));
             }
+            let resumption_source = session.resumption_source;
             actions.push(TunnelAction::SessionEstablished {
                 peer_id: self.server_peer,
                 session_id: session.id,
                 cipher_suite: self.config.cipher_suite,
                 resumed,
             });
+            if resumed {
+                let bindings: Vec<_> = self
+                    .by_peer
+                    .values()
+                    .filter_map(|conversation| {
+                        conversation.resumption.and_then(|(source, credential)| {
+                            (Some(source) == resumption_source)
+                                .then_some((conversation.id, credential))
+                        })
+                    })
+                    .collect();
+                for (conversation_id, credential) in bindings {
+                    let handle = session.handles.handle_for_or_allocate(conversation_id)?;
+                    let bytes = session.sealer.seal(
+                        FrameType::ResumeConversation,
+                        Some(handle),
+                        credential.as_bytes(),
+                    )?;
+                    actions.push(TunnelAction::SendTunnelFrame {
+                        peer_id: self.server_peer,
+                        bytes,
+                    });
+                }
+            }
             actions.extend(self.flush_queued_datagrams(now));
             actions.push(TunnelAction::ScheduleTimer(self.config.session_timeout));
             return Ok(actions);
@@ -413,8 +505,12 @@ impl ClientEngine {
         }
         session.last_received_at = now;
         if frame.frame_type == FrameType::ResumptionCredential {
-            let id = frame
-                .conversation_id
+            let handle = frame
+                .conversation_handle
+                .ok_or(EngineError::UnknownConversation)?;
+            let id = session
+                .handles
+                .id_for(handle)
                 .ok_or(EngineError::UnknownConversation)?;
             let local_peer = *self
                 .by_id
@@ -435,8 +531,12 @@ impl ClientEngine {
         if frame.frame_type != FrameType::Data {
             return Ok(Vec::new());
         }
-        let id = frame
-            .conversation_id
+        let handle = frame
+            .conversation_handle
+            .ok_or(EngineError::UnknownConversation)?;
+        let id = session
+            .handles
+            .id_for(handle)
             .ok_or(EngineError::UnknownConversation)?;
         let local_peer = *self
             .by_id
@@ -548,6 +648,15 @@ impl ClientEngine {
             ),
             last_received_at: now,
             resumed: server_hello.resumed,
+            handles: SessionConversationHandles::new(),
+            resumption_source: handshake.hello.resumption.and_then(|credential| {
+                self.by_peer.values().find_map(|conversation| {
+                    conversation
+                        .resumption
+                        .filter(|(_, candidate)| *candidate == credential)
+                        .map(|(session_id, _)| session_id)
+                })
+            }),
         });
         handshake.phase = ClientHandshakePhase::AwaitingServerAck {
             server_hello,
@@ -625,6 +734,9 @@ impl ClientEngine {
         actions.extend(expired.into_iter().map(|(peer, id)| {
             self.by_peer.remove(&peer);
             self.by_id.remove(&id);
+            if let Some(session) = self.session.as_mut() {
+                session.handles.remove(id);
+            }
             TunnelAction::ConversationClosed {
                 session_id: self.session_id(),
                 conversation_id: id,
@@ -743,6 +855,9 @@ impl ClientEngine {
     fn close(&mut self, id: ConversationId) -> Option<TunnelAction> {
         let peer = self.by_id.remove(&id)?;
         self.by_peer.remove(&peer);
+        if let Some(session) = self.session.as_mut() {
+            session.handles.remove(id);
+        }
         Some(TunnelAction::ConversationClosed {
             session_id: self.session_id(),
             conversation_id: id,
@@ -771,6 +886,8 @@ struct ServerSession {
     handshake_ack: Vec<u8>,
     client_finish: Vec<u8>,
     conversations: HashMap<ConversationId, Instant>,
+    handles: SessionConversationHandles,
+    resumed_from: Option<SessionId>,
     resumption_credential: Option<(ResumptionCredential, Instant)>,
     last_activity: Instant,
     expires_at: Instant,
@@ -1042,7 +1159,7 @@ impl ServerEngine {
         let handshake_ack = sealer.seal(FrameType::HandshakeAck, None, &[])?;
         let client_finish = frame.encode()?;
         let resume_from = pending.resume_from;
-        let conversations = resume_from.map_or_else(HashMap::new, |old_session_id| {
+        let conversations = if let Some(old_session_id) = resume_from {
             self.sessions
                 .remove(&old_session_id)
                 .map(|session| session.conversations)
@@ -1052,7 +1169,9 @@ impl ServerEngine {
                         .map(|state| state.conversations)
                 })
                 .unwrap_or_default()
-        });
+        } else {
+            HashMap::new()
+        };
         let resumption_credential = if conversations.is_empty() {
             None
         } else {
@@ -1076,6 +1195,8 @@ impl ServerEngine {
                 handshake_ack: handshake_ack.clone(),
                 client_finish,
                 conversations,
+                handles: SessionConversationHandles::new(),
+                resumed_from: resume_from,
                 resumption_credential,
                 last_activity: now,
                 expires_at: now + self.config.session_idle_timeout,
@@ -1125,18 +1246,49 @@ impl ServerEngine {
         let frame = session.opener.open(&bytes)?;
         session.last_activity = now;
         session.expires_at = now + self.config.session_idle_timeout;
+        if frame.frame_type == FrameType::ResumeConversation {
+            let (old_session_id, conversation_id) = verify_resumption_credential(
+                self.cookie_secret.as_ref(),
+                ResumptionCredential::from_bytes(
+                    frame
+                        .plaintext
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| crate::HandshakeError::InvalidResumptionCredential)?,
+                ),
+                now_ms,
+            )?;
+            if session.resumed_from != Some(old_session_id)
+                || !session.conversations.contains_key(&conversation_id)
+            {
+                return Err(EngineError::UnknownConversation);
+            }
+            let conversation_handle = frame
+                .conversation_handle
+                .ok_or(EngineError::UnknownConversation)?;
+            session.handles.bind(conversation_handle, conversation_id)?;
+            return Ok(Vec::new());
+        }
         if frame.frame_type != FrameType::Data {
             return Ok(Vec::new());
         }
-        let conversation_id = frame
-            .conversation_id
+        let conversation_handle = frame
+            .conversation_handle
             .ok_or(EngineError::UnknownConversation)?;
         let mut actions = Vec::with_capacity(2);
-        let is_new = !session.conversations.contains_key(&conversation_id);
-        if is_new {
+        let conversation_id = session.handles.id_for(conversation_handle);
+        let is_new = conversation_id.is_none();
+        let conversation_id = if let Some(conversation_id) = conversation_id {
+            conversation_id
+        } else {
             if session.conversations.len() >= self.config.max_conversations {
                 return Err(EngineError::ConversationCapacity);
             }
+            let conversation_id = ConversationId::generate()?;
+            session.handles.bind(conversation_handle, conversation_id)?;
+            conversation_id
+        };
+        if is_new {
             session.conversations.insert(conversation_id, now);
             actions.push(TunnelAction::ConversationOpened {
                 session_id: Some(session_id),
@@ -1166,22 +1318,38 @@ impl ServerEngine {
                 Some((credential, now + self.config.resumption_lifetime));
             let conversations: Vec<_> = session.conversations.keys().copied().collect();
             for conversation_id in conversations {
+                let credential = issue_resumption_credential(
+                    self.cookie_secret.as_ref(),
+                    session_id,
+                    conversation_id,
+                    now_ms,
+                    now_ms.saturating_add(lifetime_ms),
+                )?;
+                let conversation_handle = session
+                    .handles
+                    .handle_for(conversation_id)
+                    .expect("active conversation has a wire handle");
                 let bytes = session.sealer.seal(
                     FrameType::ResumptionCredential,
-                    Some(conversation_id),
+                    Some(conversation_handle),
                     credential.as_bytes(),
                 )?;
                 actions.push(TunnelAction::SendTunnelFrame { peer_id, bytes });
             }
         } else if is_new {
-            let credential = session
-                .resumption_credential
-                .as_ref()
-                .map(|(credential, _)| *credential)
-                .expect("active session has a resumption credential");
+            debug_assert!(session.resumption_credential.is_some());
+            let lifetime_ms =
+                u64::try_from(self.config.resumption_lifetime.as_millis()).unwrap_or(u64::MAX);
+            let credential = issue_resumption_credential(
+                self.cookie_secret.as_ref(),
+                session_id,
+                conversation_id,
+                now_ms,
+                now_ms.saturating_add(lifetime_ms),
+            )?;
             let bytes = session.sealer.seal(
                 FrameType::ResumptionCredential,
-                Some(conversation_id),
+                Some(conversation_handle),
                 credential.as_bytes(),
             )?;
             actions.push(TunnelAction::SendTunnelFrame { peer_id, bytes });
@@ -1211,14 +1379,15 @@ impl ServerEngine {
             .sessions
             .get_mut(&session_id)
             .ok_or(EngineError::UnknownSession)?;
-        if !session.conversations.contains_key(&conversation_id) {
-            return Err(EngineError::UnknownConversation);
-        }
+        let conversation_handle = session
+            .handles
+            .handle_for(conversation_id)
+            .ok_or(EngineError::UnknownConversation)?;
         session.last_activity = now;
         session.expires_at = now + self.config.session_idle_timeout;
         let bytes = session
             .sealer
-            .seal(FrameType::Data, Some(conversation_id), &payload)?;
+            .seal(FrameType::Data, Some(conversation_handle), &payload)?;
         Ok(vec![
             TunnelAction::SendTunnelFrame {
                 peer_id: session.peer_id,
@@ -1240,6 +1409,7 @@ impl ServerEngine {
         if session.conversations.remove(&conversation_id).is_none() {
             return Err(EngineError::UnknownConversation);
         }
+        session.handles.remove(conversation_id);
         Ok(vec![TunnelAction::ConversationClosed {
             session_id: Some(session_id),
             conversation_id,
@@ -1265,6 +1435,7 @@ impl ServerEngine {
                 .collect();
             for conversation_id in expired {
                 session.conversations.remove(&conversation_id);
+                session.handles.remove(conversation_id);
                 actions.push(TunnelAction::ConversationClosed {
                     session_id: Some(*session_id),
                     conversation_id,

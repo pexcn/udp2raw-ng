@@ -22,7 +22,7 @@ pub use engine::{
 pub use error::{
     ConfigError, CryptoError, EngineError, FrameError, HandshakeError, RecordError, ReplayError,
 };
-pub use id::{ConversationId, PeerId, SessionId};
+pub use id::{ConversationHandle, ConversationId, PeerId, SessionId};
 pub use protocol::{FrameType, MAX_FRAME_PAYLOAD, PROTOCOL_VERSION, WireFrame};
 pub use replay::ReplayWindow;
 pub use secret::Psk;

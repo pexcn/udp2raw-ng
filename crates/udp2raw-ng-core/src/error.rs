@@ -140,6 +140,8 @@ pub enum EngineError {
     InvalidRole,
     #[error("conversation capacity has been reached")]
     ConversationCapacity,
+    #[error("conversation handle space has been exhausted for this session")]
+    ConversationHandleExhausted,
     #[error("pending handshake capacity has been reached")]
     PendingHandshakeCapacity,
     #[error("per-peer pending handshake capacity has been reached")]

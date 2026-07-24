@@ -4,7 +4,7 @@ use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305};
 
 use crate::crypto::{Direction, DirectionKeys, hmac_tag, verify_hmac};
 use crate::{
-    CipherSuite, ConversationId, CryptoError, FrameType, RecordError, ReplayWindow, SessionId,
+    CipherSuite, ConversationHandle, CryptoError, FrameType, RecordError, ReplayWindow, SessionId,
     WireFrame,
 };
 
@@ -13,7 +13,7 @@ const HMAC_TAG_LENGTH: usize = 32;
 
 pub(crate) struct AuthenticatedFrame {
     pub(crate) frame_type: FrameType,
-    pub(crate) conversation_id: Option<ConversationId>,
+    pub(crate) conversation_handle: Option<ConversationHandle>,
     pub(crate) plaintext: Vec<u8>,
 }
 
@@ -52,7 +52,7 @@ impl RecordSealer {
     pub(crate) fn seal(
         &mut self,
         frame_type: FrameType,
-        conversation_id: Option<ConversationId>,
+        conversation_handle: Option<ConversationHandle>,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, RecordError> {
         if !frame_type.is_protected() {
@@ -68,7 +68,7 @@ impl RecordSealer {
             packet_number,
             epoch: 0,
             frame_type,
-            conversation_id,
+            conversation_handle,
             payload: Vec::new(),
         };
         plaintext
@@ -253,7 +253,7 @@ impl RecordOpener {
         self.replay.accept(frame.packet_number)?;
         Ok(AuthenticatedFrame {
             frame_type: frame.frame_type,
-            conversation_id: frame.conversation_id,
+            conversation_handle: frame.conversation_handle,
             plaintext,
         })
     }

@@ -1,4 +1,4 @@
-use crate::{ConversationId, FrameError, SessionId};
+use crate::{ConversationHandle, FrameError, SessionId};
 
 pub const PROTOCOL_VERSION: u16 = 4;
 /// Conservative v4 UDP payload ceiling before future per-path PMTU probing.
@@ -19,6 +19,7 @@ pub enum FrameType {
     Close = 18,
     HandshakeAck = 19,
     ResumptionCredential = 20,
+    ResumeConversation = 21,
     MtuProbe = 32,
     MtuAck = 33,
 }
@@ -34,7 +35,11 @@ impl FrameType {
     pub(crate) const fn is_protected(self) -> bool {
         matches!(
             self,
-            Self::Data | Self::Close | Self::HandshakeAck | Self::ResumptionCredential
+            Self::Data
+                | Self::Close
+                | Self::HandshakeAck
+                | Self::ResumptionCredential
+                | Self::ResumeConversation
         )
     }
 }
@@ -53,6 +58,7 @@ impl TryFrom<u8> for FrameType {
             18 => Ok(Self::Close),
             19 => Ok(Self::HandshakeAck),
             20 => Ok(Self::ResumptionCredential),
+            21 => Ok(Self::ResumeConversation),
             32 => Ok(Self::MtuProbe),
             33 => Ok(Self::MtuAck),
             _ => Err(FrameError::UnknownFrameType(value)),
@@ -68,7 +74,7 @@ pub struct WireFrame {
     pub packet_number: u64,
     pub epoch: u32,
     pub frame_type: FrameType,
-    pub conversation_id: Option<ConversationId>,
+    pub conversation_handle: Option<ConversationHandle>,
     pub payload: Vec<u8>,
 }
 
@@ -101,7 +107,8 @@ impl WireFrame {
             return Err(FrameError::PayloadTooLarge);
         }
         let raw_conversation = u32::from_be_bytes(input[20..24].try_into().expect("fixed slice"));
-        let conversation_id = std::num::NonZeroU32::new(raw_conversation).map(ConversationId::new);
+        let conversation_handle =
+            std::num::NonZeroU32::new(raw_conversation).map(ConversationHandle::new);
         let frame = Self {
             session_id: SessionId::from_u64(u64::from_be_bytes(
                 input[4..12].try_into().expect("fixed slice"),
@@ -109,7 +116,7 @@ impl WireFrame {
             packet_number: u64::from_be_bytes(input[12..20].try_into().expect("fixed slice")),
             epoch: u32::from(input[2]),
             frame_type,
-            conversation_id,
+            conversation_handle,
             payload: input[HEADER_LENGTH..].to_vec(),
         };
         frame.validate_fields()?;
@@ -127,8 +134,8 @@ impl WireFrame {
         output[12..20].copy_from_slice(&self.packet_number.to_be_bytes());
         output[20..24].copy_from_slice(
             &self
-                .conversation_id
-                .map_or(0, ConversationId::get)
+                .conversation_handle
+                .map_or(0, ConversationHandle::get)
                 .to_be_bytes(),
         );
         Ok(output)
@@ -136,7 +143,9 @@ impl WireFrame {
 
     fn validate_fields(&self) -> Result<(), FrameError> {
         match self.frame_type {
-            FrameType::Data | FrameType::ResumptionCredential if self.conversation_id.is_none() => {
+            FrameType::Data | FrameType::ResumptionCredential | FrameType::ResumeConversation
+                if self.conversation_handle.is_none() =>
+            {
                 return Err(FrameError::InvalidFrameFields);
             }
             FrameType::ClientHello
@@ -144,7 +153,7 @@ impl WireFrame {
             | FrameType::ClientFinish
             | FrameType::HelloRetry
             | FrameType::HandshakeAck
-                if self.conversation_id.is_some() =>
+                if self.conversation_handle.is_some() =>
             {
                 return Err(FrameError::InvalidFrameFields);
             }
@@ -153,7 +162,7 @@ impl WireFrame {
         if self.epoch > u32::from(u8::MAX) {
             return Err(FrameError::InvalidFrameFields);
         }
-        if self.frame_type.is_handshake() && self.conversation_id.is_some() {
+        if self.frame_type.is_handshake() && self.conversation_handle.is_some() {
             return Err(FrameError::InvalidFrameFields);
         }
         Ok(())

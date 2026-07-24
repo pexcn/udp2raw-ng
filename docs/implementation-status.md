@@ -32,7 +32,11 @@
 - conversation 容量、空闲回收、反向映射和 `(session, conversation)` 隔离；
 - PSK 长度限制、调试输出脱敏和 drop 时清零；
 - 协议版本提升到 v4，v3 `U2NG` envelope、保留 heartbeat type、非零 flags、未知 epoch 和非法 conversation 字段均在认证前显式拒绝；
-- v4 使用固定 24 字节 envelope：版本 discriminator、frame type、8 位 epoch、flags、64 位 session ID、64 位 packet number 和 session 作用域 32 位 conversation ID；body 长度从 datagram 边界推导并进入认证上下文；
+- v4 使用固定 24 字节 envelope：版本 discriminator、frame type、8 位 epoch、flags、64 位 session ID、64 位 packet number 和 session 作用域 32 位 `ConversationHandle`；body 长度从 datagram 边界推导并进入认证上下文；
+- `ConversationHandle` 只在单个已认证 session 内有效，继续由 AEAD/HMAC associated data 认证；宿主 API、`TunnelAction`、server upstream route 和恢复状态则使用独立稳定的逻辑 `ConversationId`；
+- client/server 维护每 session 的 `ConversationHandle <-> ConversationId` 双向映射；关闭或回收后旧 handle 不会在同一 session 内重新分配，未知 handle 仅能在认证且通过防重放后创建新的稳定逻辑 conversation；
+- 恢复 session 不复制旧 session 的 wire handle。认证 `HandshakeAck` 后，client 为每个已恢复 conversation 发送受保护的 `ResumeConversation` 绑定帧；server 验证其逐 conversation 恢复凭据后，把新 handle 绑定至已迁移的稳定逻辑 conversation；
+- 每个逻辑 conversation 签发独立恢复凭据，因此多 conversation 的恢复可分别重新绑定；托管服务的 `(SessionId, ConversationId)` connected upstream route 迁移不感知 wire handle；
 - 默认业务 payload 上限暂降至保守的 1150 字节，避免未来 FakeTCP/IP transport 发生外层分片；后续 PMTU 实现将按路径调整该值；
 
 ### 握手与密钥派生
@@ -118,7 +122,7 @@ client 不再在发出 `ClientFinish` 后乐观进入 `Ready`；只有受保护 
 ## 下一阶段建议
 
 1. 完成按业务触发的 client 重连：在本地业务到达时检查认证 server 活性，超时则先握手/恢复并将数据报放入既有有界队列；
-2. 为 v4 增加 session 作用域 conversation handle 分配、映射、恢复迁移和碰撞测试；当前 wire ID 已缩至 32 位，但 core 逻辑映射尚未分离；
+2. 为 session 作用域 conversation handle 增加容量耗尽、篡改绑定、跨 session 同 handle 和多 conversation 恢复的 property/fuzz 测试；
 3. 为托管服务增加全面的队列/拒绝指标、观测 API 与 shutdown drain 策略，并重新按 v4 开销计算 MTU；
 4. 实现 Tokio worker shard、稳定 session 哈希和跨 shard 有界 dispatch；
 5. 增加 Cookie 密钥轮换、来源真实 IP 归一化和握手拒绝/重试指标，并为 epoch/key rotation 固化状态机；

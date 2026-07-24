@@ -18,7 +18,7 @@ impl PeerId {
     }
 }
 
-/// Random identifier scoped to an authenticated session.
+/// Random stable logical conversation identifier exposed to embedding hosts.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConversationId(NonZeroU32);
 
@@ -45,6 +45,23 @@ impl ConversationId {
 impl fmt::Debug for ConversationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ConversationId({:#010x})", self.get())
+    }
+}
+
+/// Non-zero conversation routing handle scoped to one authenticated session.
+///
+/// This value is the only conversation identifier written to a v4 envelope.
+/// It must never be exposed as a stable host-facing conversation identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConversationHandle(NonZeroU32);
+
+impl ConversationHandle {
+    pub const fn new(value: NonZeroU32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
     }
 }
 

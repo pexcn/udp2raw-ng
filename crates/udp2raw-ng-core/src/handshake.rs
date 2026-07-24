@@ -172,7 +172,7 @@ impl ClientHello {
             packet_number: 0,
             epoch: 0,
             frame_type: FrameType::ClientHello,
-            conversation_id: None,
+            conversation_handle: None,
             payload: self.encode_payload(),
         }
     }
@@ -275,7 +275,7 @@ impl HelloRetry {
             packet_number: 0,
             epoch: 0,
             frame_type: FrameType::HelloRetry,
-            conversation_id: None,
+            conversation_handle: None,
             payload,
         }
     }
@@ -411,7 +411,7 @@ impl ServerHello {
             packet_number: 0,
             epoch: 0,
             frame_type: FrameType::ServerHello,
-            conversation_id: None,
+            conversation_handle: None,
             payload: self.encode_payload(),
         }
     }
@@ -482,7 +482,7 @@ impl ClientFinish {
             packet_number: 0,
             epoch: 0,
             frame_type: FrameType::ClientFinish,
-            conversation_id: None,
+            conversation_handle: None,
             payload,
         }
     }

@@ -235,15 +235,6 @@ fn all_cipher_suites_support_authenticated_bidirectional_data() {
                 now,
             )
             .expect("seal request");
-        let conversation_id = actions
-            .iter()
-            .find_map(|action| match action {
-                TunnelAction::ConversationOpened {
-                    conversation_id, ..
-                } => Some(*conversation_id),
-                _ => None,
-            })
-            .expect("conversation");
         let (_, request) = tunnel_frame(&actions);
         let delivered = server
             .handle(
@@ -258,12 +249,21 @@ fn all_cipher_suites_support_authenticated_bidirectional_data() {
             action,
             TunnelAction::DeliverToUpstream { payload, .. } if payload == b"request"
         )));
+        let server_conversation_id = delivered
+            .iter()
+            .find_map(|action| match action {
+                TunnelAction::DeliverToUpstream {
+                    conversation_id, ..
+                } => Some(*conversation_id),
+                _ => None,
+            })
+            .expect("server conversation");
 
         let response_actions = server
             .handle(
                 TunnelEvent::ServerDatagram {
                     session_id,
-                    conversation_id,
+                    conversation_id: server_conversation_id,
                     payload: b"response".to_vec(),
                 },
                 now,
@@ -1067,15 +1067,6 @@ fn manual_reconnect_resumes_server_conversation_across_new_session() {
             now,
         )
         .expect("initial request");
-    let conversation_id = request_actions
-        .iter()
-        .find_map(|action| match action {
-            TunnelAction::ConversationOpened {
-                conversation_id, ..
-            } => Some(*conversation_id),
-            _ => None,
-        })
-        .expect("conversation id");
     let (_, request) = tunnel_frame(&request_actions);
     let opened = server
         .handle(
@@ -1086,6 +1077,15 @@ fn manual_reconnect_resumes_server_conversation_across_new_session() {
             now,
         )
         .expect("open conversation and issue credential");
+    let server_conversation_id = opened
+        .iter()
+        .find_map(|action| match action {
+            TunnelAction::DeliverToUpstream {
+                conversation_id, ..
+            } => Some(*conversation_id),
+            _ => None,
+        })
+        .expect("server conversation id");
     let credential = tunnel_frames(&opened)
         .into_iter()
         .next()
@@ -1122,6 +1122,20 @@ fn manual_reconnect_resumes_server_conversation_across_new_session() {
         TunnelAction::SessionEstablished { resumed: true, .. }
     )));
     assert_eq!(server.session_state(old_session_id), None);
+    for (_, binding) in tunnel_frames(&client_established) {
+        assert!(
+            server
+                .handle(
+                    TunnelEvent::TunnelFrame {
+                        peer_id: client_peer,
+                        bytes: binding,
+                    },
+                    now,
+                )
+                .expect("bind restored conversation")
+                .is_empty()
+        );
+    }
 
     let after = client
         .handle(
@@ -1154,7 +1168,7 @@ fn manual_reconnect_resumes_server_conversation_across_new_session() {
             conversation_id: id,
             payload,
         } if *session_id == new_session_id
-            && *id == conversation_id
+            && *id == server_conversation_id
             && payload == b"after reconnect"
     )));
     assert!(
@@ -1167,7 +1181,7 @@ fn manual_reconnect_resumes_server_conversation_across_new_session() {
         .handle(
             TunnelEvent::ServerDatagram {
                 session_id: new_session_id,
-                conversation_id,
+                conversation_id: server_conversation_id,
                 payload: b"response after migration".to_vec(),
             },
             now,
