@@ -9,6 +9,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+getrandom.workspace = true
+pnet.workspace = true
 thiserror.workspace = true
 udp2raw-ng-core = { path = "../udp2raw-ng-core" }
 
